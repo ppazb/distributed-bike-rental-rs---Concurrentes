@@ -110,4 +110,5 @@ La idea del modelado es mantener siempre consistente la cantidad de libres frent
 | Estacion | CheckPaymentAlive (?)  | Pago | Cuando hay conexión de Pago, intentamos resolver los cobros pendientes|
 | Estación | DevolucionOK ó SolicitudOK | Usuario | **currentBike = None o currentBike = Some((id_bike, timestamp))**|
 
+
 [![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/KujF6lFv)
