@@ -91,7 +91,7 @@ La idea del modelado es mantener siempre consistente la cantidad de libres frent
 | Usuario | DevolverBici(bici: id_bicicleta, timestamp: Timestamp, medio: TarjetaCredito) | Estación | La Estación recibe la solicitud de devolución, calcula el tiempo de viaje con el tiempo actual y calcula el monto a cobrar|
 | Estación | cobro(tarjeta: TarjetaCredito, monto: usize) | Pago | La Estación envía un mensaje de de cobro y espera la respuesta **enum ResultTransaction {SUCCESS, FAILED}**|
 | | Timeout  | Estacion | La Estación encola el cobro sin respuesta en **PendingEvent**|
-| Estacion | CheckPaymentAlive (?)  | Pago | Cuando hay conexión de Pago, intentamos resolver los cobros pendientes|
+| Estacion | ChequeoPagoConectado(?)   | Pago | Cuando hay conexión de Pago, intentamos resolver los cobros pendientes|
 | Estación | DevolucionOK | Usuario | No importa si el cobro fue SUCCESS o FAILED el Usuario recibe **DevolucionOK**. El Usuario una vez que recibe el mensaje DevolucionOK, **bicicleta = None** indicando que no posee de bicicleta|
 
 ## Caso No Hay Espacio: Devolución 
@@ -107,7 +107,7 @@ La idea del modelado es mantener siempre consistente la cantidad de libres frent
 | Usuario | ConnectarAEstación | Estación | El Usuario se intenta conectar a la Estación más cercana. Una vez que el usuario se conecte a la Estación con éxito, **usuario.socket = Some(TcpStream)** |
 | Usuario | **DevolverBici**(bici: id_bicicleta, timestamp: Timestamp, medio: TarjetaCredito) ó **SolicitarBici**(bici: id_bicicleta, medio: TarjetaCredito)  | Estación | La Estación recibe la solicitud de devolución, calcula el tiempo de viaje con el tiempo actual y calcula el monto a cobrar|
 | | Timeout  | Estacion | La Estación encola **enum PedingEvent {PreAuthorization, Collection}** sin respuesta en **PendingEvent**|
-| Estacion | CheckPaymentAlive (?)  | Pago | Cuando hay conexión de Pago, intentamos resolver los cobros pendientes|
+| Estacion | ChequeoPagoConectado(?)  | Pago | Cuando hay conexión de Pago, intentamos resolver los cobros pendientes|
 | Estación | DevolucionOK ó SolicitudOK | Usuario | **currentBike = None o currentBike = Some((id_bike, timestamp))**|
 
 
