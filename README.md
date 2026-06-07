@@ -22,6 +22,8 @@ A continuación se describen los principales mecanismos que serán utilizados en
 
 ## Estación
 
+![Estructura Interna Proceso Estacion](img/ProcesoEstacionInterno.png)
+
 Cada estación se modela como un proceso independiente que ejecuta un Actor `Station`.
 
 La aplicación usuario se conecta directamente a una estación cercana para consultar disponibilidad, alquilar y devolver una bicicleta. Esta conexión usuario-estación se modela mediante TCP. 
@@ -180,7 +182,9 @@ Para el caso de **RETURN**:
 14. El líder cierra el viaje activo de la bicleta devuelta. Si la estación de alquiler es distinta de la estación de devolución, el líder notifica a la estación de alquiler la devolución de la respectiva bicicleta para que cierre el viaje activo pendiente.   
 15. La estación de alquiler de la bicicleta devuelta, una vez que reciba la notificación del líder desencola de `pending_events` el evento de `BikeRented` de la bicicleta devuelta. 
 
-![Diagrama Relación entre Actores](img/RelacionActores.png)
+<center>
+<img src="img/RelacionActores.png" alt="Diagrama Relación entre Actores" width="80%">
+</center>
 
 ### Consulta de Ubicación de una Bicicleta
 
