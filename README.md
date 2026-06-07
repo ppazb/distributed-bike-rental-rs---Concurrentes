@@ -20,6 +20,10 @@ A continuación se describen los principales mecanismos que serán utilizados en
 | Timeouts y reintentos | Pre-autorización y comunicación con servicio externo | Si una pre-autorización falla o expira durante un alquiler, la bicicleta no se entrega. Si falla un cobro durante una devolución, la bicicleta se acepta igualmente y el cobro se encola en `pending_payments` para reintarlo más tarde hasta lograrlo |
 | Log | Recuperación ante caídas | Cada estación mantiene un log local con los eventos relevantes, como inicio, cierre de viajes y el estado de la estación. Si una estación se cae, puede reconstruir su estado local desde log |
 
+## Panorama del Sistema
+
+![Diagrama de Clases](img/clases.png)
+
 ## Estación
 
 ![Estructura Interna Proceso Estacion](img/ProcesoEstacionInterno.png)
@@ -182,9 +186,7 @@ Para el caso de **RETURN**:
 14. El líder cierra el viaje activo de la bicleta devuelta. Si la estación de alquiler es distinta de la estación de devolución, el líder notifica a la estación de alquiler la devolución de la respectiva bicicleta para que cierre el viaje activo pendiente.   
 15. La estación de alquiler de la bicicleta devuelta, una vez que reciba la notificación del líder desencola de `pending_events` el evento de `BikeRented` de la bicicleta devuelta. 
 
-<center>
 <img src="img/RelacionActores.png" alt="Diagrama Relación entre Actores" width="80%">
-</center>
 
 ### Consulta de Ubicación de una Bicicleta
 
