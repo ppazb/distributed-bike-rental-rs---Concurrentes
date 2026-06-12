@@ -1,0 +1,5 @@
+# Archivo de configuración de red de estaciones
+# Formato: id_inicial,x,y,direccion_ip:puerto
+0,10,10,127.0.0.1:8001
+0,20,20,127.0.0.1:8002
+0,30,30,127.0.0.1:8003

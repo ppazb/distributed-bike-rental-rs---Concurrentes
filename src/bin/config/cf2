@@ -1,0 +1,6 @@
+# Archivo de configuración: Topología inicial de la red
+# Formato estricto: id_estacion,coordenada_x,coordenada_y,ip:puerto
+
+1,10,10,127.0.0.1:8001
+2,20,20,127.0.0.1:8002
+3,30,30,127.0.0.1:8003
