@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::models::payment_method::PaymentMethod;
 use crate::models::trip_info::TripInfo;
+use crate::models::station_event::StationEvent;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 ///Declaracion de mensajes enviados por TCP
@@ -30,11 +31,34 @@ pub enum TcpMessage {
         success: bool,
         message: String,
     },
+    WhoIsLeader {
+        origin_addr: String,
+    },
     RingElection {
-        highest_id: u32,
+        active_nodes: Vec<u32>,
     },
     RingElected {
+        active_nodes: Vec<u32>,
         leader_id: u32,
         leader_addr: String,
+        initiator_id: u32, 
+    },
+    SyncEvent {
+        origin_addr: String,
+        event: StationEvent,
+    },
+    EventACK {
+        event_id: u32,
+    },
+    ClosedTrip {
+        bike_id: u32,
+    },
+    QueryTrips {
+        origin_addr: String,
+        ttl: usize,
+    },
+    QueryTripsResponse {
+        trips: Vec<TripInfo>,
+        error: bool,
     },
 }

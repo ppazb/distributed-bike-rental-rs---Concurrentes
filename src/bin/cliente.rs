@@ -213,6 +213,7 @@ async fn main() {
 
     println!("ID de Usuario: {}", user.user_id);
 
+    // Nos conectamos automaticamente a la estacion mas cercana
     let nearest_addr = user.get_nearest_station().addr.clone();
     
     if let Some((st_id, bikes, slots)) = user.request_availability(&nearest_addr).await {
@@ -251,7 +252,7 @@ async fn main() {
                             println!("  - Bici ID: {}", bike);
                         }
                     } else {
-                        println!("ESTACIÓN en {} fuera de alcance", addr);
+                       println!("ESTACIÓN en {} fuera de alcance", addr);
                     }
                 }
             }
