@@ -135,6 +135,13 @@ struct ProcessQueryTrips {
     ttl: usize,
 }
 
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RequestPendingEventsMsg {
+    origin_addr: String,
+    ttl: usize,
+}
+
 //Mensajes paymentGateway (Pendiente de implementar)
 struct PaymentGateway {
     _log_path: PathBuf,
@@ -217,14 +224,12 @@ impl StationActor {
         if was_leader && leader_id != self.station_id {
             self.active_trips.clear();
             self.orphan_returns.clear();
-            println!("[Anillo] Rol de líder revocado pacíficamente. TripRegistry descartado.");
         }
 
-        println!("[Anillo] Líder actual de la red establecido: {}", leader_id);
+        println!("[Anillo] Lider actual de la red establecido: {}", leader_id);
     }
+
 }
-
-
 
 /// Implementacion de los hanlders de mensaje
 
@@ -328,6 +333,11 @@ impl Handler<ExecRent> for StationActor {
         };
         self.pending_events.push_back(event.clone());
         self.log_event(&format!("BIKE_RENTED: {}", msg.bike_id));
+
+        //Guardamos el evento serializado en el log para la Recuperación
+        // Si nos morimos, leemos este JSON para saber que teníamos un viaje sin confirmar.
+        self.log_event(&format!("PENDING_EVENT_ADD: {}", serde_json::to_string(&event).unwrap()));
+        
         println!("[Estación] Alquiler local registrado: Bici {}", msg.bike_id);
         
         ctx.address().do_send(SyncEventToLeader { origin_addr: self.addr.clone(), event });
@@ -350,6 +360,11 @@ impl Handler<ExecReturn> for StationActor {
         };
         self.pending_events.push_back(event.clone());
         self.log_event(&format!("BIKE_RETURNED_LOCAL_ACCEPT: {}", msg.bike_id));
+
+        //Guardamos el evento serializado de devolución en el log.
+        // Así, si caemos antes del ACK, podremos reconstruir este pendiente.
+        self.log_event(&format!("PENDING_EVENT_ADD: {}", serde_json::to_string(&event).unwrap()));
+
         println!("[Estación] Devolución local aceptada y encolada: Bici {}", msg.bike_id);
 
         ctx.address().do_send(SyncEventToLeader { origin_addr: self.addr.clone(), event });
@@ -385,6 +400,10 @@ impl Handler<ReceiveAck> for StationActor {
             
             self.log_event(&format!("BIKE_RETURNED_FULLY_SYNCED: {}", bike_id));
             println!("[Estación] Devolución sincronizada con líder y cobro autorizado: Bici {}", bike_id);
+            
+            //Solo registramos la remoción del log si fue una devolución confirmada.
+            // Los alquileres siguen pendientes de remoción hasta que el viaje entero termine (ClosedTrip).
+            self.log_event(&format!("PENDING_EVENT_REMOVE: {}", event_id));
         }
 
         self.pending_events.retain(|e| match e {
@@ -397,11 +416,21 @@ impl Handler<ReceiveAck> for StationActor {
 impl Handler<ReceiveClosedTrip> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ReceiveClosedTrip, _ctx: &mut Self::Context) -> Self::Result {
+        
+        //Buscamos el ID del evento original de alquiler para marcarlo
+        // como eliminado en el log, ya que el viaje cerró globalmente y ya no está pendiente.
+        if let Some(StationEvent::BikeRented { event_id, .. }) = self.pending_events.iter().find(|e| match e {
+            StationEvent::BikeRented { bike_id, .. } => *bike_id == msg.0,
+            _ => false,
+        }) {
+            self.log_event(&format!("PENDING_EVENT_REMOVE: {}", event_id));
+        }
+
         self.pending_events.retain(|e| match e {
             StationEvent::BikeRented { bike_id, .. } => *bike_id != msg.0,
             _ => true,
         });
-        println!("[Estación] Notificación del líder recibida. Viaje de bici {} cerrado globalmente.", msg.0);
+        println!("[Estacion] Notificación del líder recibida. Viaje de bici {} cerrado globalmente.", msg.0);
     }
 }
 
@@ -437,7 +466,7 @@ impl Handler<SyncEventToLeader> for StationActor {
                         last_owner_station: dummy_station,
                     });
                     
-                    println!("[Líder] Sincronizando nuevo viaje en TripRegistry global: Bici {}", bike_id);
+                    println!("[Lider] Sincronizando nuevo viaje en el registro global: Bici {}", bike_id);
 
                     if let Some((ret_origin, ret_event)) = self.orphan_returns.remove(&bike_id) {
                         if let StationEvent::BikeReturned { event_id: ret_event_id, .. } = ret_event {
@@ -457,7 +486,7 @@ impl Handler<SyncEventToLeader> for StationActor {
                 }
                 StationEvent::BikeReturned { event_id, bike_id, .. } => {
                     if let Some(trip) = self.active_trips.remove(&bike_id) {
-                        println!("[Líder] Cerrando viaje en TripRegistry global: Bici {}", bike_id);
+                        println!("[Líder] Cerrando viaje en el registro global: Bici {}", bike_id);
                         let owner_addr = trip.last_owner_station.addr.clone();
                         ctx.spawn(async move {
                             let _ = Self::send_tcp(owner_addr, TcpMessage::ClosedTrip { bike_id }).await;
@@ -493,20 +522,42 @@ impl Handler<ExecuteReplay> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ExecuteReplay, ctx: &mut Self::Context) -> Self::Result {
         if !self.pending_events.is_empty() {
-            println!("[Estación] Transfiriendo estado. Reenviando {} eventos al líder...", self.pending_events.len());
+            println!("[Estación] Sincronizando estado. Reenviando {} eventos al líder...", self.pending_events.len());
         }
         for event in &self.pending_events {
             ctx.address().do_send(SyncEventToLeader { origin_addr: self.addr.clone(), event: event.clone() });
         }
     }
 }
+
+// Responde a la petición del nuevo líder forzando a la estación a vaciar su cola de pendientes
+impl Handler<RequestPendingEventsMsg> for StationActor {
+    type Result = ();
+    fn handle(&mut self, msg: RequestPendingEventsMsg, ctx: &mut Self::Context) -> Self::Result {
+        // Si el mensaje dio la vuelta y llegó al líder que lo originó, se descarta.
+        if msg.origin_addr == self.addr { return; }
+
+        println!("[Red] Solicitud del lider para reconstruior. Enviando eventos pendientes al nuevo líder...");
+        ctx.address().do_send(ReplayPendingEvents);
+
+        // Pasamos el mensaje al siguiente nodo en el anillo restando 1 al TTL.
+        if msg.ttl > 0 {
+            if let Some(next) = &self.next_station_addr {
+                let target = next.clone();
+                ctx.spawn(async move {
+                    let _ = Self::send_tcp(target, TcpMessage::RequestPendingEvents { origin_addr: msg.origin_addr, ttl: msg.ttl - 1 }).await;
+                }.into_actor(self));
+            }
+        }
+    }
+}
+
 ///Si soy el lider muestro el registro global de viajes, si no lo soy paso el mensaje a mi siguiente
 ///de esta forma siempre tenemos al lider como actor de la verdad
 impl Handler<ConsoleQueryTrips> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ConsoleQueryTrips, ctx: &mut Self::Context) -> Self::Result {
         if self.is_electing || self.leader.is_none() {
-            println!("Red en proceso de estabilización y elección. Intente luego.");
             return;
         }
 
@@ -569,7 +620,7 @@ impl Handler<UpdateNextNode> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: UpdateNextNode, _ctx: &mut Self::Context) -> Self::Result {
         self.next_station_addr = Some(msg.0.clone());
-        println!("[Red] Enlace de topología establecido hacia: {}", msg.0);
+        println!("[Red] Enlace establecido hacia: {}", msg.0);
     }
 }
 ///Me autodeclaro lider, porque o bien gane la eleccion o bien estoy solo
@@ -589,7 +640,6 @@ impl Handler<DeclareSelfLeader> for StationActor {
             self.active_trips.clear();
             self.orphan_returns.clear();
         }
-        println!("[Anillo] Proclamado líder autónomo de la red.");
         ctx.address().do_send(ReplayPendingEvents);
     }
 }
@@ -658,7 +708,7 @@ impl Handler<HealRing> for StationActor {
                 if !found_any {
                     self_addr.do_send(DeclareSelfLeader);
                 } else if was_leader {
-                    println!("[Alarma] Líder caído detectado. Iniciando proceso de elección.");
+                    println!("Lider caído detectado arranco eleccion.");
                     self_addr.do_send(StartElection);
                 }
             }
@@ -695,6 +745,16 @@ impl Handler<ProcessRingElection> for StationActor {
 
             self.set_leader(leader_id, leader_addr.clone());
             ctx.address().do_send(ReplayPendingEvents);
+
+            //El nuevo líder pide explícitamente a la red que envíe todos sus eventos pendientes 
+            // para poder reconstruir el registro global de viajes perdidos.
+            if let Some(next) = &self.next_station_addr {
+                let target = next.clone();
+                let req_msg = TcpMessage::RequestPendingEvents { origin_addr: self.addr.clone(), ttl: self.known_stations.len() };
+                ctx.spawn(async move {
+                    let _ = Self::send_tcp(target, req_msg).await;
+                }.into_actor(self));
+            }
 
             if let Some(next) = &self.next_station_addr {
                 let target = next.clone();
@@ -807,6 +867,9 @@ impl Handler<HandleIncomingTcp> for StationActor {
                                 let _ = stream.write_all((serde_json::to_string(&resp).unwrap() + "\n").as_bytes()).await;
                             }
                         }
+                        TcpMessage::RequestPendingEvents { origin_addr, ttl } => {
+                            self_addr.do_send(RequestPendingEventsMsg { origin_addr, ttl });
+                        }
                         TcpMessage::SyncEvent { origin_addr, event } => {
                             self_addr.do_send(SyncEventToLeader { origin_addr, event });
                         }
@@ -840,7 +903,7 @@ impl Handler<HandleIncomingTcp> for StationActor {
                             self_addr.do_send(ProcessRingElected { active_nodes, leader_id, leader_addr, initiator_id });
                         }
                         TcpMessage::Availability { .. } | TcpMessage::RentResponse { .. } | TcpMessage::ReturnResponse { .. } => {
-                            println!("[Red] Advertencia: Paquete mal ruteado descartado.");
+                            println!("[Red] EL paquete no tiene la serializacion correcta, descartado.");
                         }
                     }
                 }
@@ -855,7 +918,7 @@ impl Handler<HandleIncomingTcp> for StationActor {
 ///fucnion para procesar y leer los archivos de configuracion para armar la estacion
 fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
     let contents = fs::read_to_string(path).unwrap_or_else(|_| {
-        eprintln!("Fallo crítico: Imposible resolver acceso a archivo de configuración: '{}'", path);
+        eprintln!("Error: Imposible acceder al archivo de configuracion: '{}'", path);
         std::process::exit(1);
     });
 
@@ -875,12 +938,74 @@ fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
     }
 
     if stations.is_empty() {
-        eprintln!("Fallo crítico: Topología vacía en archivo de configuración.");
+        eprintln!("Error:red vacía en archivo de configuración.");
         std::process::exit(1);
     }
     stations
 }
 
+// Además de contar bicicletas, ahora buscamos los eventos PENDING_EVENT_ADD y PENDING_EVENT_REMOVE.
+// Esto permite reconstruir la cola de eventos que la estación no llegó a sincronizar
+// con el líder antes de morir. De esta manera, al reconectarse a un nuevo líder, 
+// podrá reenviar los eventos pendientes (como viajes activos) y recuperar el estado global.
+fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>) -> (Vec<u32>, u32, VecDeque<StationEvent>) {
+    let mut event_counter = 1;
+    //usamos un mapa para ir guardando y borrando los eventos según el log
+    let mut pending_events_map: HashMap<u32, StationEvent> = HashMap::new();
+    
+    if let Ok(contents) = fs::read_to_string(log_path) {
+        println!("[Estacion] Archivo de log encontrado. Reconstruyendo estado físico y eventos...");
+        
+        for line in contents.lines() {
+            if let Some(idx) = line.find("BIKE_RENTED: ") {
+                let bike_id_str = &line[idx + "BIKE_RENTED: ".len()..];
+                if let Ok(bike_id) = bike_id_str.trim().parse::<u32>() {
+                    available_bikes.retain(|&id| id != bike_id);
+                    event_counter += 1;
+                }
+            } else if let Some(idx) = line.find("BIKE_RETURNED_LOCAL_ACCEPT: ") {
+                let bike_id_str = &line[idx + "BIKE_RETURNED_LOCAL_ACCEPT: ".len()..];
+                if let Ok(bike_id) = bike_id_str.trim().parse::<u32>() {
+                    if !available_bikes.contains(&bike_id) {
+                        available_bikes.push(bike_id);
+                    }
+                    event_counter += 1;
+                }
+            } 
+            //Recuperación de eventos pendientes.
+            // Si leemos un ADD, convertimos el JSON de texto a la estructura StationEvent y la guardamos
+            else if let Some(idx) = line.find("PENDING_EVENT_ADD: ") {
+                let json_str = &line[idx + "PENDING_EVENT_ADD: ".len()..];
+                if let Ok(event) = serde_json::from_str::<StationEvent>(json_str) {
+                    let ev_id = match &event {
+                        StationEvent::BikeRented { event_id, .. } => *event_id,
+                        StationEvent::BikeReturned { event_id, .. } => *event_id,
+                    };
+                    pending_events_map.insert(ev_id, event);
+                }
+            }
+            //Si leemos un REMOVE, significa que el líder confirmó el evento antes de que
+            // esta estación muriera, por ende ya no está "pendiente". Lo borramos.
+            else if let Some(idx) = line.find("PENDING_EVENT_REMOVE: ") {
+                let id_str = &line[idx + "PENDING_EVENT_REMOVE: ".len()..];
+                if let Ok(ev_id) = id_str.trim().parse::<u32>() {
+                    pending_events_map.remove(&ev_id);
+                }
+            }
+        }
+        println!("[Estacion] Estado reconstruido. Bicicletas actuales: {:?}", available_bikes);
+        //Informar cuántos eventos pendientes se recuperaron
+        if !pending_events_map.is_empty() {
+            println!("[Estacion] Se recuperaron {} eventos pendientes de sincronizar.", pending_events_map.len());
+        }
+    } else {
+        println!("[Estacion] No se encontró log previo. Iniciando con estado por defecto.");
+    }
+    
+    // Convertimos el HashMap final a una cola VecDeque para devolverlo junto a las bicis
+    let pending_events: VecDeque<StationEvent> = pending_events_map.into_values().collect();
+    (available_bikes, event_counter, pending_events)
+}
 
 ///Main asyncrono para poder manejar el lanzamiento del actor, asi como tambien las operaciones I/O
 #[actix_rt::main]
@@ -897,7 +1022,7 @@ async fn main() -> std::io::Result<()> {
 
     let known_stations = load_stations_from_config(config_path);
     let self_station = known_stations.iter().find(|s| s.station_id == station_id).unwrap_or_else(|| {
-        eprintln!("Fallo crítico: ID {} no localizado en topología configurada.", station_id);
+        eprintln!("Error: ID {} no localizado en red configurada.", station_id);
         std::process::exit(1);
     }).clone();
 
@@ -906,25 +1031,28 @@ async fn main() -> std::io::Result<()> {
     let start = 1 + 10 * (station_id - 1);
     let end = station_id * 10;
     let initial_bikes: Vec<u32> = (start..=end).collect();
+    let log_path = PathBuf::from(format!("station_{}.log", port));
     
+    // Desestructuramos la tupla ampliada que ahora también trae los `recovered_pending_events`
+    let (recovered_bikes, recovered_event_counter, recovered_pending_events) = recover_state_from_log(&log_path, initial_bikes);
 
     let station_actor = StationActor {
         station_id,
         addr: self_station.addr.clone(),
         location: self_station.location,
         max_slots,
-        available_bikes: initial_bikes,
+        available_bikes: recovered_bikes, //Ahora usamos el "recuperado" que vale lo del config en caso de primer lanzamiento
         leader: None,
         known_stations,
         next_station_addr: None,
         payment_gateway: gateway,
-        pending_events: VecDeque::new(),
+        pending_events: recovered_pending_events, //Inicializamos la cola con los eventos recuperados desde el log
         pending_payments: VecDeque::new(),
         active_trips: HashMap::new(),
         orphan_returns: HashMap::new(),
         log_path: PathBuf::from(format!("station_{}.log", port)),
         is_electing: false,
-        event_counter: 1,
+        event_counter: recovered_event_counter, //Ahora usamos el "recuperado" que vale 0 si es la primera vez que se lanza
     }.start();
 
     let listener = TcpListener::bind(&self_station.addr).await?;

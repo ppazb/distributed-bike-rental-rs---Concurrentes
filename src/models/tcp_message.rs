@@ -3,8 +3,8 @@ use crate::models::payment_method::PaymentMethod;
 use crate::models::trip_info::TripInfo;
 use crate::models::station_event::StationEvent;
 
+/// Protocolo de comunicación serializable sobre TCP.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-///Declaracion de mensajes enviados por TCP
 pub enum TcpMessage {
     GetBikes,
     Availability {
@@ -43,6 +43,10 @@ pub enum TcpMessage {
         leader_addr: String,
         initiator_id: u32, 
     },
+    RequestPendingEvents {
+        origin_addr: String,
+        ttl: usize,
+    },
     SyncEvent {
         origin_addr: String,
         event: StationEvent,
@@ -53,6 +57,7 @@ pub enum TcpMessage {
     ClosedTrip {
         bike_id: u32,
     },
+    
     QueryTrips {
         origin_addr: String,
         ttl: usize,
