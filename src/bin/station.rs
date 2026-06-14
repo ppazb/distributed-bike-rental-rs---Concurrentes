@@ -950,6 +950,7 @@ impl Handler<HandleIncomingTcp> for StationActor {
         let gateway = self.payment_gateway.clone();
         let disconnected = self.is_disconnected.clone(); 
         let next_node = self.next_station_addr.clone();
+        let station_addr = self.addr.clone(); 
 
         ctx.spawn(async move {
             let mut reader = BufReader::new(&mut stream);
@@ -969,7 +970,7 @@ impl Handler<HandleIncomingTcp> for StationActor {
                             let free_slots = max_slots.saturating_sub(bikes.len());
                             if disconnected {
                                 // Si está desconectado del resto, solamente devuelve su dispoinibilidad
-                                stations_availability.push((station_id, bikes.clone(), free_slots));
+                                stations_availability.push((station_id, station_addr.clone(), bikes.clone(), free_slots));
                                 let resp = TcpMessage::GetAllStationsAvailability { origin_station_id, stations_availability };
                                 let serialized = serde_json::to_string(&resp).unwrap() + "\n";
                                 let _ = stream.write_all(serialized.as_bytes()).await;
@@ -987,22 +988,22 @@ impl Handler<HandleIncomingTcp> for StationActor {
                                         // Si origin_station_id es 0 significa que es el primer request del cliente
                                         // debo cambiar el origin_station_id por mi station_id, sino dejo el station_id que me pasaron
                                         let origin = if origin_station_id == 0 { station_id } else { origin_station_id }; 
-                                        stations_availability.push((station_id, bikes.clone(), free_slots)); 
+                                        stations_availability.push((station_id, station_addr.clone(), bikes.clone(), free_slots)); 
                                         
                                         // Creo el mensaje de Forward para la siguiente estación 
                                         let forward_msg = TcpMessage::GetAllStationsAvailability { 
                                             origin_station_id: origin, 
                                             stations_availability 
                                         };
+                                        let serialized_fwd = serde_json::to_string(&forward_msg).unwrap() + "\n";
 
                                         if let Some(next_addr) = &next_node { 
                                             // Me conecto a la siguiente estación 
                                             if let Ok(mut next_stream) = TcpStream::connect(next_addr).await {
                                                 
                                                 // Enviamos el foward_msg a la siguiente estación
-                                                let serialized_fwd = serde_json::to_string(&forward_msg).unwrap() + "\n";
-                                                let _ = next_stream.write_all(serialized_fwd.as_bytes()).await;
                                                 
+                                                let _ = next_stream.write_all(serialized_fwd.as_bytes()).await;
                                                 let mut reader = BufReader::new(next_stream);
                                                 let mut line = String::new();
                                                 
@@ -1016,7 +1017,8 @@ impl Handler<HandleIncomingTcp> for StationActor {
                                                     let _ = stream.write_all(line.as_bytes()).await;
                                                 }
                                             } else {
-                                                println!("[GetBikes] Error para conectar a la siguiente estación ({})", next_addr);
+                                                // Si no logro conectarme a la siguiente devuelvo lo que tengo 
+                                                let _ = stream.write_all(serialized_fwd.as_bytes()).await;
                                             }
                                         }
                             }

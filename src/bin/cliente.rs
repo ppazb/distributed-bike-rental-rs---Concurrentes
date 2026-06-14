@@ -284,7 +284,8 @@ async fn main() {
                         
                         if let Ok(TcpMessage::GetAllStationsAvailability { stations_availability, .. }) = 
                             serde_json::from_str(&line) {
-                                for (st_id, bikes, slots) in stations_availability {
+                                for (st_id, addr, bikes, slots) in stations_availability {
+                                    user.update_station_id(&addr, st_id.clone());
                                     println!("ESTACIÓN [{}]: {} bicis, {} slots libres", st_id, bikes.len(), slots);
                                     for bike in bikes {
                                         println!("  - Bici ID: {}", bike);

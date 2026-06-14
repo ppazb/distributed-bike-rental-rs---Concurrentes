@@ -14,7 +14,8 @@ pub enum TcpMessage {
     },
     GetAllStationsAvailability {
         origin_station_id: u32, 
-        stations_availability: Vec<(u32, Vec<u32>, usize)> 
+        // (station_id, station address, available_bikes, free_slots)
+        stations_availability: Vec<(u32, String, Vec<u32>, usize)> 
     },
     RentBike {
         user_id: u32,
