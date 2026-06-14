@@ -142,6 +142,23 @@ struct RequestPendingEventsMsg {
     ttl: usize,
 }
 
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ConsoleDisconnect;
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ConsoleConnect;
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RegisterDeadNode(String);
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RegisterAliveNode(String);
+
+
 //Mensajes paymentGateway (Pendiente de implementar)
 struct PaymentGateway {
     _log_path: PathBuf,
@@ -185,6 +202,8 @@ struct StationActor {
     log_path: PathBuf,//path del archivo para escribir el log de la estacion
     is_electing: bool,//si se esta en una eleccion de lider actualmente
     event_counter: u32,//contador de eventos para generar eventos unicos
+    is_disconnected: bool, // Determina si la estación debe ignorar los eventos de anillo
+    logically_dead: Vec<String>, // Lista de nodos que avisaron que se desconectaron, para no pingearlos
 }
 
 impl StationActor {
@@ -224,9 +243,10 @@ impl StationActor {
         if was_leader && leader_id != self.station_id {
             self.active_trips.clear();
             self.orphan_returns.clear();
+            println!("[Anillo] Rol de líder revocado pacíficamente. TripRegistry descartado.");
         }
 
-        println!("[Anillo] Lider actual de la red establecido: {}", leader_id);
+        println!("[Anillo] Líder actual de la red establecido: {}", leader_id);
     }
 
 }
@@ -257,12 +277,16 @@ impl Actor for StationActor {
 impl Handler<Bootup> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: Bootup, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } 
+
         let mut sorted = self.known_stations.clone();
         sorted.sort_by_key(|s| s.station_id);
         let my_idx = sorted.iter().position(|s| s.station_id == self.station_id).unwrap();
         
         let self_addr = ctx.address();
         let my_ip = self.addr.clone();
+        let dead_list = self.logically_dead.clone();
+
         //lanzo tarea para buscar vecino, arrancando desde mi siguiente directo, el primero que me
         //contesta, es mi vecino, actualizo ese valor y le pregunto quien es el lider
         ctx.spawn(async move {
@@ -270,6 +294,8 @@ impl Handler<Bootup> for StationActor {
             let mut found = false;
             for offset in 1..n {
                 let target = &sorted[(my_idx + offset) % n];
+                if dead_list.contains(&target.addr) { continue; }
+
                 if TcpStream::connect(&target.addr).await.is_ok() {
                     self_addr.do_send(UpdateNextNode(target.addr.clone()));
                     let _ = Self::send_tcp(target.addr.clone(), TcpMessage::WhoIsLeader { origin_addr: my_ip.clone() }).await;
@@ -301,6 +327,7 @@ impl Handler<VerifyLeaderTimeout> for StationActor {
 impl Handler<ProcessWhoIsLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessWhoIsLeader, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         if let Some(l) = &self.leader {
             let target = msg.0;
             let leader_id = l.station_id;
@@ -334,8 +361,8 @@ impl Handler<ExecRent> for StationActor {
         self.pending_events.push_back(event.clone());
         self.log_event(&format!("BIKE_RENTED: {}", msg.bike_id));
 
-        //Guardamos el evento serializado en el log para la Recuperación
-        // Si nos morimos, leemos este JSON para saber que teníamos un viaje sin confirmar.
+        // Guardamos el evento serializado en el log para la Recuperación Total.
+        // Si nos morimos, leeremos este JSON para saber que teníamos un viaje sin confirmar.
         self.log_event(&format!("PENDING_EVENT_ADD: {}", serde_json::to_string(&event).unwrap()));
         
         println!("[Estación] Alquiler local registrado: Bici {}", msg.bike_id);
@@ -361,7 +388,7 @@ impl Handler<ExecReturn> for StationActor {
         self.pending_events.push_back(event.clone());
         self.log_event(&format!("BIKE_RETURNED_LOCAL_ACCEPT: {}", msg.bike_id));
 
-        //Guardamos el evento serializado de devolución en el log.
+        // Guardamos el evento serializado de devolución en el log.
         // Así, si caemos antes del ACK, podremos reconstruir este pendiente.
         self.log_event(&format!("PENDING_EVENT_ADD: {}", serde_json::to_string(&event).unwrap()));
 
@@ -377,6 +404,7 @@ impl Handler<ExecReturn> for StationActor {
 impl Handler<ReceiveAck> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ReceiveAck, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         let event_id = msg.0;
         
         let event_opt = self.pending_events.iter().find(|e| match e {
@@ -401,7 +429,7 @@ impl Handler<ReceiveAck> for StationActor {
             self.log_event(&format!("BIKE_RETURNED_FULLY_SYNCED: {}", bike_id));
             println!("[Estación] Devolución sincronizada con líder y cobro autorizado: Bici {}", bike_id);
             
-            //Solo registramos la remoción del log si fue una devolución confirmada.
+            // Solo registramos la remoción del log si fue una devolución confirmada.
             // Los alquileres siguen pendientes de remoción hasta que el viaje entero termine (ClosedTrip).
             self.log_event(&format!("PENDING_EVENT_REMOVE: {}", event_id));
         }
@@ -416,8 +444,8 @@ impl Handler<ReceiveAck> for StationActor {
 impl Handler<ReceiveClosedTrip> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ReceiveClosedTrip, _ctx: &mut Self::Context) -> Self::Result {
-        
-        //Buscamos el ID del evento original de alquiler para marcarlo
+        if self.is_disconnected { return; } // NUEVO
+        // Buscamos el ID del evento original de alquiler para marcarlo
         // como eliminado en el log, ya que el viaje cerró globalmente y ya no está pendiente.
         if let Some(StationEvent::BikeRented { event_id, .. }) = self.pending_events.iter().find(|e| match e {
             StationEvent::BikeRented { bike_id, .. } => *bike_id == msg.0,
@@ -449,7 +477,7 @@ impl Handler<EnqueueFailedPayment> for StationActor {
 impl Handler<SyncEventToLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: SyncEventToLeader, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_electing || self.leader.is_none() { return; }
+        if self.is_disconnected || self.is_electing || self.leader.is_none() { return; }
 
         let is_leader = self.leader.as_ref().map_or(false, |l| l.station_id == self.station_id);
         let event = msg.event;
@@ -534,6 +562,7 @@ impl Handler<ExecuteReplay> for StationActor {
 impl Handler<RequestPendingEventsMsg> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: RequestPendingEventsMsg, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         // Si el mensaje dio la vuelta y llegó al líder que lo originó, se descarta.
         if msg.origin_addr == self.addr { return; }
 
@@ -557,6 +586,11 @@ impl Handler<RequestPendingEventsMsg> for StationActor {
 impl Handler<ConsoleQueryTrips> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ConsoleQueryTrips, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected {
+            println!("[Simulador] Estación desconectada. No se puede consultar la red.");
+            return;
+        }
+
         if self.is_electing || self.leader.is_none() {
             return;
         }
@@ -582,7 +616,7 @@ impl Handler<ConsoleQueryTrips> for StationActor {
 impl Handler<ProcessQueryTrips> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessQueryTrips, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_electing { return; }
+        if self.is_electing || self.is_disconnected { return; } // NUEVO
         
         let is_leader = self.leader.as_ref().map_or(false, |l| l.station_id == self.station_id);
         if is_leader {
@@ -611,6 +645,7 @@ impl Handler<ProcessQueryTrips> for StationActor {
 impl Handler<SetLeaderMsg> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: SetLeaderMsg, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         self.set_leader(msg.leader_id, msg.leader_addr);
         ctx.address().do_send(ReplayPendingEvents);
     }
@@ -619,6 +654,7 @@ impl Handler<SetLeaderMsg> for StationActor {
 impl Handler<UpdateNextNode> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: UpdateNextNode, _ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         self.next_station_addr = Some(msg.0.clone());
         println!("[Red] Enlace establecido hacia: {}", msg.0);
     }
@@ -627,6 +663,7 @@ impl Handler<UpdateNextNode> for StationActor {
 impl Handler<DeclareSelfLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: DeclareSelfLeader, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         self.is_electing = false;
         let was_leader = self.leader.as_ref().map_or(false, |l| l.station_id == self.station_id);
         
@@ -650,6 +687,8 @@ impl Handler<DeclareSelfLeader> for StationActor {
 impl Handler<CheckNeighborHealth> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: CheckNeighborHealth, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; }
+
         let current_next = self.next_station_addr.clone();
         let self_addr = ctx.address();
         
@@ -658,17 +697,20 @@ impl Handler<CheckNeighborHealth> for StationActor {
         let my_idx = sorted.iter().position(|s| s.station_id == self.station_id).unwrap();
         let ideal_next = &sorted[(my_idx + 1) % sorted.len()];
         let ideal_addr = ideal_next.addr.clone();
+        let dead_list = self.logically_dead.clone();
 
         ctx.spawn(async move {
             if Some(ideal_addr.clone()) != current_next {
-                if TcpStream::connect(&ideal_addr).await.is_ok() {
-                    self_addr.do_send(UpdateNextNode(ideal_addr.clone()));
-                    return;
+                if !dead_list.contains(&ideal_addr) { // NUEVO
+                    if TcpStream::connect(&ideal_addr).await.is_ok() {
+                        self_addr.do_send(UpdateNextNode(ideal_addr.clone()));
+                        return;
+                    }
                 }
             }
 
             if let Some(addr) = current_next {
-                if TcpStream::connect(&addr).await.is_err() {
+                if dead_list.contains(&addr) || TcpStream::connect(&addr).await.is_err() {
                     self_addr.do_send(HealRing { dead_addr: addr });
                 }
             }
@@ -679,6 +721,7 @@ impl Handler<CheckNeighborHealth> for StationActor {
 impl Handler<HealRing> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: HealRing, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         let dead_addr = msg.dead_addr;
         let was_leader = self.leader.as_ref().map_or(false, |l| l.addr == dead_addr);
 
@@ -688,6 +731,7 @@ impl Handler<HealRing> for StationActor {
         sorted.sort_by_key(|s| s.station_id);
         let my_id = self.station_id;
         let self_addr = ctx.address();
+        let dead_list = self.logically_dead.clone(); // NUEVO
 
         ctx.spawn(async move {
             if let Some(my_idx) = sorted.iter().position(|s| s.station_id == my_id) {
@@ -696,7 +740,7 @@ impl Handler<HealRing> for StationActor {
                 
                 for offset in 1..n {
                     let target = &sorted[(my_idx + offset) % n];
-                    if target.addr == dead_addr { continue; } 
+                    if target.addr == dead_addr || dead_list.contains(&target.addr) { continue; } 
                     
                     if TcpStream::connect(&target.addr).await.is_ok() {
                         self_addr.do_send(UpdateNextNode(target.addr.clone()));
@@ -719,6 +763,7 @@ impl Handler<HealRing> for StationActor {
 impl Handler<StartElection> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: StartElection, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         if self.is_electing { return; }
         self.is_electing = true;
         
@@ -735,6 +780,7 @@ impl Handler<StartElection> for StationActor {
 impl Handler<ProcessRingElection> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessRingElection, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         let mut active_nodes = msg.0;
         if !self.is_electing { self.is_electing = true; }
 
@@ -781,6 +827,7 @@ impl Handler<ProcessRingElection> for StationActor {
 impl Handler<ProcessRingElected> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessRingElected, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; } // NUEVO
         if msg.initiator_id == self.station_id {
             return;
         }
@@ -817,6 +864,79 @@ impl Handler<RetryPendingPayments> for StationActor {
         }
     }
 }
+
+// Permite aislar a la estación avisando al resto del anillo, mientras sigue atendiendo clientes.
+impl Handler<ConsoleDisconnect> for StationActor {
+    type Result = ();
+    fn handle(&mut self, _msg: ConsoleDisconnect, ctx: &mut Self::Context) -> Self::Result {
+        if self.is_disconnected { return; }
+        self.is_disconnected = true;
+        self.leader = None;
+        self.next_station_addr = None;
+        self.is_electing = false;
+        println!("[Simulador] Estación desconectada del anillo lógicamente. Aceptando solo clientes locales.");
+        
+        // Avisar a todas las demás estaciones que simulen una falla TCP hacia nosotros
+        let dead_addr = self.addr.clone();
+        for st in &self.known_stations {
+            if st.addr != dead_addr {
+                let target = st.addr.clone();
+                let dead = dead_addr.clone();
+                ctx.spawn(async move {
+                    let _ = Self::send_tcp(target, TcpMessage::NodeDisconnected { dead_addr: dead }).await;
+                }.into_actor(self));
+            }
+        }
+    }
+}
+
+impl Handler<ConsoleConnect> for StationActor {
+    type Result = ();
+    fn handle(&mut self, _msg: ConsoleConnect, ctx: &mut Self::Context) -> Self::Result {
+        if !self.is_disconnected { return; }
+        self.is_disconnected = false;
+        println!("[Simulador] Estación reconectándose al anillo...");
+        
+        // Avisa a todos que volvió para que no nos ignoren
+        let alive_addr = self.addr.clone();
+        for st in &self.known_stations {
+            if st.addr != alive_addr {
+                let target = st.addr.clone();
+                let msg = TcpMessage::NodeReconnected { alive_addr: alive_addr.clone() };
+                ctx.spawn(async move {
+                    let _ = Self::send_tcp(target, msg).await;
+                }.into_actor(self));
+            }
+        }
+        
+        // Inicia el proceso nativo para sumarse a la red como cuando arranca el programa
+        ctx.address().do_send(Bootup);
+    }
+}
+
+// Estos comandos son los que reciben los vecinos cuando la estación avisa que se desconectó
+impl Handler<RegisterDeadNode> for StationActor {
+    type Result = ();
+    fn handle(&mut self, msg: RegisterDeadNode, ctx: &mut Self::Context) -> Self::Result {
+        if !self.logically_dead.contains(&msg.0) {
+            self.logically_dead.push(msg.0.clone());
+        }
+        // Si el muerto era mi vecino en la red, o mi líder, llamo a re-armar el anillo
+        if self.next_station_addr == Some(msg.0.clone()) || 
+           self.leader.as_ref().map(|l| l.addr == msg.0).unwrap_or(false) {
+            ctx.address().do_send(HealRing { dead_addr: msg.0 });
+        }
+    }
+}
+
+impl Handler<RegisterAliveNode> for StationActor {
+    type Result = ();
+    fn handle(&mut self, msg: RegisterAliveNode, _ctx: &mut Self::Context) -> Self::Result {
+        self.logically_dead.retain(|a| a != &msg.0);
+        println!("[Red] Nodo {} vuelve a estar disponible lógicamente.", msg.0);
+    }
+}
+
 ///handleo de los mensajes recibidos por TCP, escucho por el socket y proceso la respuesta en
 /// base al mensaje recibido, devio en el caso correspondiente, renta, devolucion, sincronizar, ack,etc
 impl Handler<HandleIncomingTcp> for StationActor {
@@ -828,6 +948,8 @@ impl Handler<HandleIncomingTcp> for StationActor {
         let bikes = self.available_bikes.clone();
         let max_slots = self.max_slots;
         let gateway = self.payment_gateway.clone();
+        let disconnected = self.is_disconnected.clone(); 
+        let next_node = self.next_station_addr.clone();
 
         ctx.spawn(async move {
             let mut reader = BufReader::new(&mut stream);
@@ -842,6 +964,64 @@ impl Handler<HandleIncomingTcp> for StationActor {
                             let serialized = serde_json::to_string(&resp).unwrap() + "\n";
                             let _ = stream.write_all(serialized.as_bytes()).await;
                         }
+
+                        TcpMessage::GetAllStationsAvailability { origin_station_id, mut stations_availability} => {
+                            let free_slots = max_slots.saturating_sub(bikes.len());
+                            if disconnected {
+                                // Si está desconectado del resto, solamente devuelve su dispoinibilidad
+                                stations_availability.push((station_id, bikes.clone(), free_slots));
+                                let resp = TcpMessage::GetAllStationsAvailability { origin_station_id, stations_availability };
+                                let serialized = serde_json::to_string(&resp).unwrap() + "\n";
+                                let _ = stream.write_all(serialized.as_bytes()).await;
+                            } else if origin_station_id == station_id {
+                                // Si origin_station_id == station_id significa que se dio la vuelta y tendría que volver 
+                                println!("[GetBikes] Devuelvo Availability: {} | {:?}", origin_station_id, stations_availability); 
+                                let resp = TcpMessage::GetAllStationsAvailability { origin_station_id, stations_availability };
+                                let serialized = serde_json::to_string(&resp).unwrap() + "\n";
+                                // Este stream viene de la estación anterior que forwardeo la consula, por lo que se lo mando devuelta para 
+                                // que vuelva el mensaje hacia la primera estación que forwardeo el request 
+                                let _ = stream.write_all(serialized.as_bytes()).await;
+                            } else {
+                                println!("[GetBikes] pasando query"); 
+                                        // Es una consulta recursiva para no perder el stream del cliente que hizo la consulta                     
+                                        // Si origin_station_id es 0 significa que es el primer request del cliente
+                                        // debo cambiar el origin_station_id por mi station_id, sino dejo el station_id que me pasaron
+                                        let origin = if origin_station_id == 0 { station_id } else { origin_station_id }; 
+                                        stations_availability.push((station_id, bikes.clone(), free_slots)); 
+                                        
+                                        // Creo el mensaje de Forward para la siguiente estación 
+                                        let forward_msg = TcpMessage::GetAllStationsAvailability { 
+                                            origin_station_id: origin, 
+                                            stations_availability 
+                                        };
+
+                                        if let Some(next_addr) = &next_node { 
+                                            // Me conecto a la siguiente estación 
+                                            if let Ok(mut next_stream) = TcpStream::connect(next_addr).await {
+                                                
+                                                // Enviamos el foward_msg a la siguiente estación
+                                                let serialized_fwd = serde_json::to_string(&forward_msg).unwrap() + "\n";
+                                                let _ = next_stream.write_all(serialized_fwd.as_bytes()).await;
+                                                
+                                                let mut reader = BufReader::new(next_stream);
+                                                let mut line = String::new();
+                                                
+                                                // Nos quedamos esperando la respuesta de la siguiente estacióń
+                                                // la consulta es recursiva, la consulta completa volverá a la estación 
+                                                // de donde el cliente hizo la consulta. 
+                                                if reader.read_line(&mut line).await.is_ok() && !line.is_empty() {
+                                                    // Si la siguiente estación nos devuelve la respuesta se lo mandamos 
+                                                    // a la estación anterior que forwardeo la consulta y asi sucesivamente hasta llegar
+                                                    // a la primera estación que recibió la consulta del cliente
+                                                    let _ = stream.write_all(line.as_bytes()).await;
+                                                }
+                                            } else {
+                                                println!("[GetBikes] Error para conectar a la siguiente estación ({})", next_addr);
+                                            }
+                                        }
+                            }
+                        }
+                        
                         TcpMessage::RentBike { user_id, bike_id, payment_method } => {
                             let auth = gateway.send(ProcessPayment { _payment: payment_method, _amount: 500.0 }).await.unwrap_or(false);
                             if auth && bikes.contains(&bike_id) {
@@ -901,6 +1081,12 @@ impl Handler<HandleIncomingTcp> for StationActor {
                         }
                         TcpMessage::RingElected { active_nodes, leader_id, leader_addr, initiator_id } => {
                             self_addr.do_send(ProcessRingElected { active_nodes, leader_id, leader_addr, initiator_id });
+                        }
+                        TcpMessage::NodeDisconnected { dead_addr } => {
+                            self_addr.do_send(RegisterDeadNode(dead_addr));
+                        }
+                        TcpMessage::NodeReconnected { alive_addr } => {
+                            self_addr.do_send(RegisterAliveNode(alive_addr));
                         }
                         TcpMessage::Availability { .. } | TcpMessage::RentResponse { .. } | TcpMessage::ReturnResponse { .. } => {
                             println!("[Red] EL paquete no tiene la serializacion correcta, descartado.");
@@ -1053,6 +1239,8 @@ async fn main() -> std::io::Result<()> {
         log_path: PathBuf::from(format!("station_{}.log", port)),
         is_electing: false,
         event_counter: recovered_event_counter, //Ahora usamos el "recuperado" que vale 0 si es la primera vez que se lanza
+        is_disconnected: false, //Para simular desconexion de la red
+        logically_dead: Vec::new(),
     }.start();
 
     let listener = TcpListener::bind(&self_station.addr).await?;
@@ -1075,6 +1263,11 @@ async fn main() -> std::io::Result<()> {
             if reader.read_line(&mut line).await.is_ok() {
                 if line.trim() == "viajes" {
                     actor_for_stdin.do_send(ConsoleQueryTrips);
+                } 
+                else if line.trim() == "desconectar" {
+                    actor_for_stdin.do_send(ConsoleDisconnect);
+                } else if line.trim() == "conectar" {
+                    actor_for_stdin.do_send(ConsoleConnect);
                 }
             }
         }

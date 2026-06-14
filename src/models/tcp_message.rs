@@ -12,6 +12,10 @@ pub enum TcpMessage {
         bikes_available: Vec<u32>,
         free_slots: usize,
     },
+    GetAllStationsAvailability {
+        origin_station_id: u32, 
+        stations_availability: Vec<(u32, Vec<u32>, usize)> 
+    },
     RentBike {
         user_id: u32,
         bike_id: u32,
@@ -65,5 +69,11 @@ pub enum TcpMessage {
     QueryTripsResponse {
         trips: Vec<TripInfo>,
         error: bool,
+    },
+    NodeDisconnected {
+        dead_addr: String,
+    },
+    NodeReconnected {
+        alive_addr: String,
     },
 }

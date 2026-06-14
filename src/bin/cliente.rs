@@ -21,17 +21,35 @@ struct UserClient {
 }
 
 impl UserClient {
-    /// Determina la estación mas cercana, para autoconectarse a ella
+
+    // Extrae la lógia de cálculo de distancias 
+    fn distance_to(&self, station: &StationInfo) -> isize {
+        let dx = (station.location.0 as isize - self.location.location.0 as isize).abs();
+        let dy = (station.location.1 as isize - self.location.location.1 as isize).abs();
+        dx * dx + dy * dy 
+    }
+
+    /// Me devuelve la estación más cercana de acuerdo a la distancia calculada
     fn get_nearest_station(&self) -> &StationInfo {
         self.known_stations
             .iter()
-            .min_by_key(|station| {
-                let dx = (station.location.0 as isize - self.location.location.0 as isize).abs();
-                let dy = (station.location.1 as isize - self.location.location.1 as isize).abs();
-                // Retorna la distancia al cuadrado
-                dx * dx + dy * dy 
-            })
+            .min_by_key(|station| self.distance_to(station))
             .unwrap()
+    }
+
+    /// Usado en get_bikes para que me devuelvan la estación más cercana viva
+    async fn connect_to_network(&self) -> Option<TcpStream> {
+        let mut stations = self.known_stations.clone();
+        
+        stations.sort_by_key(|station| self.distance_to(station));
+
+        for station in stations {
+            if let Ok(stream) = TcpStream::connect(&station.addr).await {
+                return Some(stream);
+            }
+        }
+        // Devuelve None si ninguna de las estaciones está viva 
+        None
     }
 
     /// Busca una estación entre las estaciones conocidas local mediante su ID
@@ -183,6 +201,8 @@ fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
     stations
 }
 
+
+
 ///Main asincrono con manejo de I/O para insertar comandos al usuario (get_bikes, rent etc)
 
 #[tokio::main]
@@ -244,17 +264,34 @@ async fn main() {
         // match de comandos
         match parts[0] {
             "get_bikes" => {
-                let addrs: Vec<String> = user.known_stations.iter().map(|s| s.addr.clone()).collect();
-                for addr in addrs {
-                    if let Some((st_id, bikes, slots)) = user.request_availability(&addr).await {
-                        println!("ESTACIÓN [{}]: {} bicis, {} slots libres", st_id, bikes.len(), slots);
-                        for bike in bikes {
-                            println!("  - Bici ID: {}", bike);
+
+                    // Me conecto a la estación más cercana viva 
+                    if let Some(mut stream) = user.connect_to_network().await {
+                    
+                        // Creo el mensaje de pedido de availability es la misma tanto para cliente como para 
+                        // la estación (la estación usa el mismo tipo de mensaje para el forwardeo)
+                        let msg = TcpMessage::GetAllStationsAvailability { 
+                            origin_station_id: 0, // El cliente arranca con origin_station_id = 0 para que la estación pueda identificar que el mensaje vino de un cliente
+                            stations_availability: vec![] 
+                        };
+                        // Le envío la solicitud a la estación más cercana
+                        stream.write_all((serde_json::to_string(&msg).unwrap() + "\n").as_bytes()).await.unwrap();
+                        
+                        // Espero la respuesta ccon todas disponibles de todas las estaciones
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        reader.read_line(&mut line).await.unwrap();
+                        
+                        if let Ok(TcpMessage::GetAllStationsAvailability { stations_availability, .. }) = 
+                            serde_json::from_str(&line) {
+                                for (st_id, bikes, slots) in stations_availability {
+                                    println!("ESTACIÓN [{}]: {} bicis, {} slots libres", st_id, bikes.len(), slots);
+                                    for bike in bikes {
+                                        println!("  - Bici ID: {}", bike);
+                                    }
+                                }
                         }
-                    } else {
-                       println!("ESTACIÓN en {} fuera de alcance", addr);
                     }
-                }
             }
             "rent" => {
                 if parts.len() != 3 {
