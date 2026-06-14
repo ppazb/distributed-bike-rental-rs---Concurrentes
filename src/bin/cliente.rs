@@ -5,7 +5,9 @@ use bici_concu::models::tcp_message::TcpMessage;
 use bici_concu::models::trip_info::TripInfo;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufReader};
 use tokio::net::TcpStream;
 
@@ -18,9 +20,17 @@ struct UserClient {
     payment_method: PaymentMethod,//Metodo de pago
     current_trip: Option<TripInfo>,//VIaje actual, o none
     trip_counter: u32,// contador de viaje para identificador de los viajes activos
+    log_path: PathBuf
 }
 
 impl UserClient {
+
+    // Logeo de eventos para la reconstrucción, igual que en Station
+    fn log_event(&self, event_desc: &str) {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.log_path) {
+            let _ = writeln!(file, "[{}] {}", chrono::Utc::now(), event_desc);
+        }
+    }
 
     // Extrae la lógia de cálculo de distancias 
     fn distance_to(&self, station: &StationInfo) -> isize {
@@ -110,12 +120,14 @@ impl UserClient {
                 let trip_id = self.trip_counter;
                 self.trip_counter += 1;
                 // Si fue exitoso, creamos el viaje actual y lo asignamos al usuario
-                self.current_trip = Some(TripInfo {
+                let current_trip = TripInfo {
                     trip_id,
                     current_bike_id: bike_id,
                     start_time: chrono::Utc::now(),
                     last_owner_station: target_station,
-                });
+                }; 
+                self.log_event(&format!("ACTIVE_TRIP: {}", serde_json::to_string(&current_trip).unwrap()));
+                self.current_trip = Some(current_trip);
                 return true;
             }
         }
@@ -150,6 +162,7 @@ impl UserClient {
         if let Ok(TcpMessage::ReturnResponse { success, .. }) = serde_json::from_str(&line) {
             if success {
                 // si el viaje termino, desreferenciamos el viaje
+                self.log_event(&format!("CLOSED_TRIP: {}", serde_json::to_string(&self.current_trip).unwrap()));
                 self.current_trip = None;
                 return true;
             }
@@ -158,7 +171,56 @@ impl UserClient {
     }
 }
 
-//Funciones auxiliares
+// Funciones Auxiliares
+
+/// Función para la recuperación del último viaje activo no cerrado del usuario
+/// como el usuario solamente puede tener un único current_trip, entonces solamente
+/// me importa la última línea del log, si la última línea es un ACTIVE_TRIP
+/// si es CLOSED TRIP significa que no hay ningún viaje activo 
+async fn recover_state_from_log(log_path: &PathBuf) -> Option<TripInfo> {
+        
+        let log_contents = match tokio::fs::read_to_string(log_path).await {
+            Ok(content) => content,
+            Err(_) => {
+                println!("[LOG] No existe log previo del usuario.");
+                return None;
+            }
+        };
+
+        // Busco la última línea no vacía del log 
+        let last_line = log_contents
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())?;
+
+        // Si es CLOSED_TRIP significa que el viaje ya fue cerrado, no hay ninguno pendiente
+        if last_line.contains("CLOSED_TRIP") {
+            println!("[LOG] Último estado: viaje cerrado.");
+            return None;
+        }; 
+
+        // Busco la posición desde donde arranca ACTIVE_TRIP
+        if let Some(pos) = last_line.find("ACTIVE_TRIP:") {
+            // Obtengo el trim de json donde debería estar station_info guardado
+            let json_trip_info = last_line[pos + "ACTIVE_TRIP:".len()..].trim();
+
+            // Parseo TripInfo de json si no me da OK signfica que hubo error de parseo 
+            // Sino devuelvo el trip_info parseado 
+            match serde_json::from_str::<TripInfo>(json_trip_info) {
+                Ok(trip_info) => {
+                    println!("[LOG] viaje activo recuperado: bike_id={}", trip_info.current_bike_id);
+                    return Some(trip_info);
+                }
+                Err(e) => {
+                    println!("[LOG] error de parseo: {}", e);
+                    return None;
+                }
+            }
+        }
+
+        println!("[LOG] log vacío");
+        None
+}
 
 /// Parsea un archivo de texto plano para construir la red de estaciones
 fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
@@ -208,27 +270,33 @@ fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 {
-        eprintln!("Sintaxis requerida: <coord_x> <coord_y> <ruta_archivo_config>");
+    if args.len() < 5 {
+        eprintln!("Sintaxis requerida: <coord_x> <coord_y> <user_id> <ruta_archivo_config>");
         eprintln!("Ejemplo: cargo run --bin user 11 12 src/bin/config/cf1");
         std::process::exit(1);
     }
 
     let x: usize = args[1].parse().unwrap();
     let y: usize = args[2].parse().unwrap();
-    let config_path = &args[3];
+    // Obtengo el id pasado por consola 
+    let id: u32 = args[3].parse().unwrap();
+    let config_path = &args[4];
 
     // Carga la red automaticamente desde el archivo
     let known_stations = load_stations_from_config(config_path);
     println!("cargadas {} estaciones desde {}", known_stations.len(), config_path);
+
+    let new_log_path = PathBuf::from(format!("user_{}.log", id)); 
+    let reconstructed_current_trip = recover_state_from_log(&new_log_path).await; 
 
     let mut user = UserClient {
         user_id: 1,
         location: Location { location: (x, y) },
         known_stations,
         payment_method: PaymentMethod::CreditCard("4512-4412-1102-8854".into()),
-        current_trip: None,
+        current_trip: reconstructed_current_trip, // reconstructed_current_trip es un Option, se lo paso directo
         trip_counter: 1,
+        log_path: new_log_path, // le paso el PathBuf ya construido
     };
 
     println!("ID de Usuario: {}", user.user_id);
