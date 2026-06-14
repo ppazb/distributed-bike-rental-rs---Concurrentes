@@ -1216,8 +1216,8 @@ async fn main() -> std::io::Result<()> {
 
     let port = self_station.addr.split(':').last().unwrap();
     let gateway = PaymentGateway { _log_path: PathBuf::from(format!("gateway_{}.log", port)) }.start();
-    let start = 1 + 10 * (station_id - 1);
-    let end = station_id * 10;
+    let start = 1 + max_slots as u32 * (station_id - 1);
+    let end = station_id * max_slots as u32;
     let initial_bikes: Vec<u32> = (start..=end).collect();
     let log_path = PathBuf::from(format!("station_{}.log", port));
     
