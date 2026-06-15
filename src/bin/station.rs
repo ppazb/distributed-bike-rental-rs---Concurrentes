@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 const BANK_ADDR: &str = "127.0.0.1:4000";
 
-//Declaracion de mesajes de actor estacion
+// Declaración de mesajes de actor estacion
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -240,12 +240,12 @@ impl Handler<ProcessPayment> for PaymentGateway {
     }
 }
 
-// Implementacion actor estacion
+// Implementación del Actor StationActor 
 
 struct StationActor {
-    station_id: u32, //Id para identificar cada estacion de manera unica, para la estructura de anillo
-    addr: String, //Direccion de la estacion
-    location: (usize, usize),//representa la ubicacion
+    station_id: u32, // Id para identificar cada estación de manera única, para la estructura de anillo
+    addr: String, // Dirección de la estación
+    location: (usize, usize),// Representa la ubicacion
     max_slots: usize,//cantidad de slot maxima de bicicleta
     available_bikes: Vec<u32>, // bicicletas en la estacion
     leader: Option<StationInfo>,//Option de la estacion lider, porque puede no tener referencia
@@ -264,18 +264,21 @@ struct StationActor {
 }
 
 impl StationActor {
-    ///Funcion para flushear eventos al archivo log de la estacion
+
+    ///Función para flushear eventos al archivo log de la estación
     fn log_event(&self, event_desc: &str) {
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.log_path) {
             let _ = writeln!(file, "[{}] {}", chrono::Utc::now(), event_desc);
         }
     }
+
     ///Helper para enviar pagos y esperar respuesta
     async fn send_payment(gateway: Addr<PaymentGateway>, payment: PaymentMethod, amount: f64, user_id: u32, station_id: u32) -> bool {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         gateway.do_send(ProcessPayment { payment, amount, user_id, station_id, reply_to: Some(tx) });
         rx.recv().await.unwrap_or(false)
     }
+
     ///Funcion asyncrona para enviar los mensajes a otra estacion partiendo de formato json, usa serde
     /// para serializar y enviar el por el TCP socket de tokio
     async fn send_tcp(addr: String, msg: TcpMessage) -> Result<(), std::io::Error> {
@@ -285,13 +288,14 @@ impl StationActor {
         }
         Ok(())
     }
-    //devuelve id actual y suma uno al contador
+    // Devuelve ID actual y suma uno al contador
     fn next_event_id(&mut self) -> u32 {
         let id = self.event_counter;
         self.event_counter += 1;
         id
     }
-    ///Actualizo el lider, verificando si antes yo era lider para limpiar mi registro de viajes
+
+    /// Actualizo el lider, verificando si antes yo era líder para limpiar mi registro de viajes
     fn set_leader(&mut self, leader_id: u32, leader_addr: String) {
         let was_leader = self.leader.as_ref().map_or(false, |l| l.station_id == self.station_id);
         self.is_electing = false;
@@ -318,28 +322,37 @@ impl StationActor {
 
 impl Actor for StationActor {
     type Context = Context<Self>;
-    ///Funcion que se llama al iniciar un actor en actix, permite configurar runtimes automaticos
+    /// Función que se llama al iniciar un actor en actix, permite configurar runtimes automaticos
     /// con timers
     fn started(&mut self, ctx: &mut Self::Context) {
         println!("Estación {} activa en dirección {}", self.station_id, self.addr);
         self.log_event("STATION_STARTED");
-        //lanzamos una tarea para reintentar pagos pendientes cada 5 segundos
+        // Lanzamos una tarea para reintentar los pagos pendientes cada 5 segundos
         ctx.run_interval(Duration::from_secs(5), |_actor, ctx| {
             ctx.address().do_send(RetryPendingPayments);
         });
-        //lanzamos una tarea para verificar que nuestro vecino sigue vivo
+        // Lanzamos una tarea para verificar que nuestro vecino sigue vivo. El Handler de CheckNeighborHealth
+        // chequea si mi siguiente ideal es igual la siguiente estáción que tengo guardada. Si son distintos 
+        // y mi siguiente ideal no está en la lista de nodos muertos, se intenta conectarse al siguiente ideal
+        // si logro conectarme, actualizo mi siguiente al siguiente ideal 
+        // Si la estación siguiente actual es igual a la ideal, me fijo si me puedo conectar o si está en la lista
+        // de los nodos muertos, si cumple con alguno de los dos, mando HealRing para reconstruir el anillo. 
         ctx.run_interval(Duration::from_secs(2), |_actor, ctx| {
             ctx.address().do_send(CheckNeighborHealth);
         });
-        //autoenvia de mensaje para unirme a la red
+
+        // Autoenviamos de mensaje para unirme a la red
         ctx.address().do_send(Bootup);
     }
 }
-///Asumo que no estoy solo en la red e intento unirme a la red de forma natural, le pregunto a mi
-/// vecino quien es el lider y actualizo. Si nadie me responde, entonces si estoy solo, soy el lider
+
+/// Asumimos que no estoy solo en la red e intento unirme a la red de forma natural, le pregunto a mi
+/// vecino quién es el lider y actualizo. Si nadie me responde, significa que estoy solo y me autoproclamo líder
 impl Handler<Bootup> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: Bootup, ctx: &mut Self::Context) -> Self::Result {
+        // Evitamos integrar a la red si me encuentro desconectada del resto 
+        // Desconexión simulada
         if self.is_disconnected { return; } 
 
         let mut sorted = self.known_stations.clone();
@@ -350,15 +363,22 @@ impl Handler<Bootup> for StationActor {
         let my_ip = self.addr.clone();
         let dead_list = self.logically_dead.clone();
 
-        //lanzo tarea para buscar vecino, arrancando desde mi siguiente directo, el primero que me
-        //contesta, es mi vecino, actualizo ese valor y le pregunto quien es el lider
+        // Lanzamos tarea para buscar vecino por si ya tenemos un anillo existente, 
+        // arrancando desde mi siguiente directo, el primero que me contesta
+        // va a ser mi siguiente, actualizo ese valor y le pregunto quien es el lider
         ctx.spawn(async move {
             let n = sorted.len();
             let mut found = false;
+
+            // Circulamos nuestra lista de estaciones partiendo desde mi ID
             for offset in 1..n {
                 let target = &sorted[(my_idx + offset) % n];
+                // Si la dirección está en la lista de los nodos desconectados, lo ignoro 
                 if dead_list.contains(&target.addr) { continue; }
 
+                // Intentamos conectarnos a la siguiente calculada, si tuvimos éxito 
+                // autoenviamos UpdateNextnode para actualizar el siguente nodo, 
+                // y preguntamos a este nuevo siguiente por socket quién es el líder actual  
                 if TcpStream::connect(&target.addr).await.is_ok() {
                     self_addr.do_send(UpdateNextNode(target.addr.clone()));
                     let _ = Self::send_tcp(target.addr.clone(), TcpMessage::WhoIsLeader { origin_addr: my_ip.clone() }).await;
@@ -366,31 +386,47 @@ impl Handler<Bootup> for StationActor {
                     break;
                 }
             }
-            //no encontre a nadie, soy el lider
+
+            // Si después de iterar toda la lista de estaciones y no encontramos ninguno 
+            // "vivo", nos autoclamamos líder
             if !found {
                 self_addr.do_send(DeclareSelfLeader);
             } else {
+                // Si encontramos a un siguiente, esperamos 3 segundos para que se sincronicen los 
+                // mensajes de consulta y respuesta 
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                // Verificamos si el líder está vivo o la estación a la que preguntamos no nos respondió nada
                 self_addr.do_send(VerifyLeaderTimeout);
             }
         }.into_actor(self));
     }
 }
-///Si paso el tiempo y todavia no tengo lider, es decir es none y ademas no se esta en votacion
-/// lanzo yo la votacion, hay que elegir lider
+
+
+/// Si pasó el tiempo y todavía no tenemos lider, es decir es None y además no estamos en elección 
+/// lanzamos elección para elegir un nuevo líder
 impl Handler<VerifyLeaderTimeout> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: VerifyLeaderTimeout, ctx: &mut Self::Context) -> Self::Result {
+        // Chequeamos si me respondieron algo, si no me respondieron nada, signfica que el 
+        // líder del otro también es None. Chequeamos, también si estamos en elección
         if self.leader.is_none() && !self.is_electing {
+            // Autoenviamos para arrancar una elección 
             ctx.address().do_send(StartElection);
         }
     }
 }
-///Si recibo el mensaje y se quien es el lider, respondo.
+
+/// Si recibimos el mensaje WhoIsLeader y tengo algún líder, repondo la inforamción del líder
 impl Handler<ProcessWhoIsLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessWhoIsLeader, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+
+        // Si estamos desconecado del resto, no procesamos nada 
+        if self.is_disconnected { return; } 
+
+        // Si tenemos ya algún líder, armamos el mensaje RingElected con el ID del líder 
+        // y le enviamos el mensaje a quien nos mandó WhoIsLeader
         if let Some(l) = &self.leader {
             let target = msg.0;
             let leader_id = l.station_id;
@@ -407,13 +443,13 @@ impl Handler<ProcessWhoIsLeader> for StationActor {
     }
 }
 
-///handleo de la operacion de rentar una bici, actualizando, todos los atributos del actor,
-/// encolando los eventos y avisando al lider de la transaccion
+/// Handleo de la operación de rentar una bici, actualizando todos los atributos del actor,
+/// encolando los eventos y avisando al líder de la transacción
 impl Handler<ExecRent> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ExecRent, ctx: &mut Self::Context) -> Self::Result {
         self.available_bikes.retain(|&id| id != msg.bike_id);
-        //creo el evento con la informacion correspondiente
+        // Creamos el evento de BikeRented con la informacion correspondiente
         let event = StationEvent::BikeRented {
             event_id: self.next_event_id(),
             user_id: msg.user_id,
@@ -421,6 +457,7 @@ impl Handler<ExecRent> for StationActor {
             bike_id: msg.bike_id,
             timestamp: chrono::Utc::now(),
         };
+        // Encolamos el Evento en pending_events para sincronización con el líder
         self.pending_events.push_back(event.clone());
         self.log_event(&format!("BIKE_RENTED: {}", msg.bike_id));
 
@@ -430,15 +467,20 @@ impl Handler<ExecRent> for StationActor {
         
         println!("[Estación] Alquiler local registrado: Bici {}", msg.bike_id);
         
+        // Autoenviamos el mensaje SyncEventToLeader para enviar este nuevo evento al líder 
         ctx.address().do_send(SyncEventToLeader { origin_addr: self.addr.clone(), event });
     }
 }
-///handleo de la operacion de retorno de bici, encola el evento pendiente, y avisa al lider que la 
-/// operacion termino.
+
+/// Handleo de la operación de retorno de bici, encola el evento pendiente, y avisa al líder que la 
+/// operación termino.
 impl Handler<ExecReturn> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ExecReturn, ctx: &mut Self::Context) -> Self::Result {
+
+        // Encolamos el ID de la bici que me devolvieron 
         self.available_bikes.push(msg.bike_id);
+        // Creamos un nuevo evento de BikeReturned 
         let event = StationEvent::BikeReturned {
             event_id: self.next_event_id(),
             user_id: msg.user_id,
@@ -448,6 +490,8 @@ impl Handler<ExecReturn> for StationActor {
             return_time: chrono::Utc::now(),
             payment_method: msg.payment,
         };
+
+        // Encolamos el Evento en eventos pendientes para sincronización con el líder
         self.pending_events.push_back(event.clone());
         self.log_event(&format!("BIKE_RETURNED_LOCAL_ACCEPT: {}", msg.bike_id));
 
@@ -457,12 +501,14 @@ impl Handler<ExecReturn> for StationActor {
 
         println!("[Estación] Devolución local aceptada y encolada: Bici {}", msg.bike_id);
 
+        // Autoenviamos el mensaje para sincronización con el líder
         ctx.address().do_send(SyncEventToLeader { origin_addr: self.addr.clone(), event });
     }
 }
-///hanldeo de los ACK, respuestas del lider a los avisos de recibidos. busca el id del evento que 
+
+/// Hanldeo de los ACK, respuestas del lider a los avisos de recibidos. busca el id del evento que 
 /// matchee el que se recibio,verifica que el lider haya confirmado la devolucion y por lo tanto
-/// puedo generar la informacion de cobro y  luego lanzar una tarea para verificar que e pago 
+/// puedo generar la informacion de cobro y luego lanzar una tarea para verificar que e pago 
 /// se complete o no, si falla encolo a los pagos pendientes. Cuando se confirma, se elimina de la cola
 impl Handler<ReceiveAck> for StationActor {
     type Result = ();
@@ -503,11 +549,12 @@ impl Handler<ReceiveAck> for StationActor {
         });
     }
 }
-///hadleo de que se aviso que el viaje cerro, por lo tanto ya puedo eliminar el viaje de mi cola
+
+/// Hadleo del aviso que el viaje cerró, por lo tanto ya puedo eliminar el viaje de mi cola
 impl Handler<ReceiveClosedTrip> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ReceiveClosedTrip, _ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; } 
         // Buscamos el ID del evento original de alquiler para marcarlo
         // como eliminado en el log, ya que el viaje cerró globalmente y ya no está pendiente.
         if let Some(StationEvent::BikeRented { event_id, .. }) = self.pending_events.iter().find(|e| match e {
@@ -517,6 +564,7 @@ impl Handler<ReceiveClosedTrip> for StationActor {
             self.log_event(&format!("PENDING_EVENT_REMOVE: {}", event_id));
         }
 
+        // Remuevo el BikeRented correspondiente a ese evento de devolución 
         self.pending_events.retain(|e| match e {
             StationEvent::BikeRented { bike_id, .. } => *bike_id != msg.0,
             _ => true,
@@ -534,9 +582,9 @@ impl Handler<EnqueueFailedPayment> for StationActor {
 }
 
 
-/// handleo de mensaje para mantener sincronizada la red, el lider mantiene actualizado el estado
+/// Handleo de mensaje para mantener sincronizada la red, el lider mantiene actualizado el estado
 /// global del sistema, si el lider arranca en blaco por ejemplo por una nueva votacion
-/// tengo que reconstruir todo los eventos pendientes, lanzo rafaga de mensajes para ello
+/// tengo que reconstruir todo los eventos pendientes, lanzo ráfaga de mensajes para ello
 impl Handler<SyncEventToLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: SyncEventToLeader, ctx: &mut Self::Context) -> Self::Result {
@@ -596,7 +644,8 @@ impl Handler<SyncEventToLeader> for StationActor {
         }
     }
 }
-///Funcion para comenzar a reconstruir los eventos pendientes
+
+/// Handle para comenzar a reconstruir los eventos pendientes
 impl Handler<ReplayPendingEvents> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ReplayPendingEvents, ctx: &mut Self::Context) -> Self::Result {
@@ -604,14 +653,17 @@ impl Handler<ReplayPendingEvents> for StationActor {
         // Diferimos la ejecución medio segundo para asegurar que el líder levantó el thread TCP.
         ctx.spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            // Autoenviamos el mensaje para enviar todos los eventos pendientes 
             self_addr.do_send(ExecuteReplay);
         }.into_actor(self));
     }
 }
-///Funcion para ir sincronizando los eventos 
+
+/// Sincronizamos eventos pendientes de pending_events de la estación con el líder 
 impl Handler<ExecuteReplay> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ExecuteReplay, ctx: &mut Self::Context) -> Self::Result {
+        // Si no está vacío, avisamos de que vamos a sincronizar eventos con el líder
         if !self.pending_events.is_empty() {
             println!("[Estación] Sincronizando estado. Reenviando {} eventos al líder...", self.pending_events.len());
         }
@@ -627,15 +679,18 @@ impl Handler<RequestPendingEventsMsg> for StationActor {
     fn handle(&mut self, msg: RequestPendingEventsMsg, ctx: &mut Self::Context) -> Self::Result {
         if self.is_disconnected { return; } // NUEVO
         // Si el mensaje dio la vuelta y llegó al líder que lo originó, se descarta.
+        // Si yo fui la estación que originé el mensaje termino, no hago nada
         if msg.origin_addr == self.addr { return; }
 
         println!("[Red] Solicitud del lider para reconstruior. Enviando eventos pendientes al nuevo líder...");
         ctx.address().do_send(ReplayPendingEvents);
+        // Autoenvío los eventos pendientes 
 
         // Pasamos el mensaje al siguiente nodo en el anillo restando 1 al TTL.
         if msg.ttl > 0 {
             if let Some(next) = &self.next_station_addr {
                 let target = next.clone();
+                // Si hay nodos pendientes seguimos propagando ese mensaje
                 ctx.spawn(async move {
                     let _ = Self::send_tcp(target, TcpMessage::RequestPendingEvents { origin_addr: msg.origin_addr, ttl: msg.ttl - 1 }).await;
                 }.into_actor(self));
@@ -644,8 +699,8 @@ impl Handler<RequestPendingEventsMsg> for StationActor {
     }
 }
 
-///Si soy el lider muestro el registro global de viajes, si no lo soy paso el mensaje a mi siguiente
-///de esta forma siempre tenemos al lider como actor de la verdad
+/// Si soy el lider muestro el registro global de viajes, si no lo soy paso el mensaje a mi siguiente
+/// de esta forma siempre tenemos al lider como actor de la verdad
 impl Handler<ConsoleQueryTrips> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ConsoleQueryTrips, ctx: &mut Self::Context) -> Self::Result {
@@ -676,6 +731,7 @@ impl Handler<ConsoleQueryTrips> for StationActor {
         }
     }
 }
+
 impl Handler<ProcessQueryTrips> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessQueryTrips, ctx: &mut Self::Context) -> Self::Result {
@@ -703,7 +759,8 @@ impl Handler<ProcessQueryTrips> for StationActor {
         }
     }
 }
-///handleo para setear el lider, luego lanzo tarea para rejecutar los eventos pendientes,
+
+/// Handleo para setear el lider, luego lanzo tarea para rejecutar los eventos pendientes,
 /// ya que como se llavo a setear lider, este cambio y por lo tanto tenemos que sincronizar
 impl Handler<SetLeaderMsg> for StationActor {
     type Result = ();
@@ -713,7 +770,7 @@ impl Handler<SetLeaderMsg> for StationActor {
         ctx.address().do_send(ReplayPendingEvents);
     }
 }
-///Actualizo mi vecino
+/// Actualizo mi vecino
 impl Handler<UpdateNextNode> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: UpdateNextNode, _ctx: &mut Self::Context) -> Self::Result {
@@ -722,28 +779,38 @@ impl Handler<UpdateNextNode> for StationActor {
         println!("[Red] Enlace establecido hacia: {}", msg.0);
     }
 }
-///Me autodeclaro lider, porque o bien gane la eleccion o bien estoy solo
+/// Me autodeclaro lider, porque o bien gane la eleccion o bien estoy solo
 impl Handler<DeclareSelfLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: DeclareSelfLeader, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
-        self.is_electing = false;
+        // Si estoy desconectado, no hago nada, no tiene sentido
+        // No se puede consultar la red
+        if self.is_disconnected { return; } 
+        self.is_electing = false; // No está habiendo elección 
+        // Verificamos si ya éramos el líder. 
         let was_leader = self.leader.as_ref().map_or(false, |l| l.station_id == self.station_id);
         
+        // Actualizamos el líder. Creamos el nuevo StationInfo para el líder
         self.leader = Some(StationInfo {
             station_id: self.station_id,
             location: self.location,
             addr: self.addr.clone(),
         });
 
+        // Si no era el líder, limpiamos active_trips y orphan_returns
+        // Si era el último líder, puedo tener mantener lo último 
         if !was_leader {
+            // Si no fui el último líder, tengo que limpiar todo 
             self.active_trips.clear();
             self.orphan_returns.clear();
         }
+
+        // Autoenvío ReplayPendingEvents
         ctx.address().do_send(ReplayPendingEvents);
     }
 }
-///pruebo si mi siguiente normal (es decir mi id +1), esta vivo, si lo esta y me
+
+/// Pruebo si mi siguiente normal (es decir mi id +1), esta vivo, si lo esta y me
 /// contesta, pero no era mi siguiente quiere decir que se callo
 /// por lo tanto lo vuelvo a incluir, si no esta vivo, mando mensaje a su siguiente y asi, hasta
 /// actualizar mi nuevo vecino, si mi vecino era el lider, llamo a eleccion
@@ -760,11 +827,14 @@ impl Handler<CheckNeighborHealth> for StationActor {
         let my_idx = sorted.iter().position(|s| s.station_id == self.station_id).unwrap();
         let ideal_next = &sorted[(my_idx + 1) % sorted.len()];
         let ideal_addr = ideal_next.addr.clone();
-        let dead_list = self.logically_dead.clone();
+        let dead_list = self.logically_dead.clone(); // Evaluamos los nodos muertos simulados
 
         ctx.spawn(async move {
+            // Intentamos recuperar el anillo y se fija si está el siguiente ideal, si no está
+            // continúa con el siguiente original 
+            // Si mi ideal no es igual al siguiente de ahora no entra
             if Some(ideal_addr.clone()) != current_next {
-                if !dead_list.contains(&ideal_addr) { // NUEVO
+                if !dead_list.contains(&ideal_addr) { 
                     if TcpStream::connect(&ideal_addr).await.is_ok() {
                         self_addr.do_send(UpdateNextNode(ideal_addr.clone()));
                         return;
@@ -772,7 +842,10 @@ impl Handler<CheckNeighborHealth> for StationActor {
                 }
             }
 
+            // Intentamos conectarnos a nuestro current_next
             if let Some(addr) = current_next {
+                // si current_next está en la lista de los nodos muertos o no logramos 
+                // conectarnos disparamos HealRing para reconstruir el anillo
                 if dead_list.contains(&addr) || TcpStream::connect(&addr).await.is_err() {
                     self_addr.do_send(HealRing { dead_addr: addr });
                 }
@@ -780,32 +853,42 @@ impl Handler<CheckNeighborHealth> for StationActor {
         }.into_actor(self));
     }
 }
-///trato de curar la red de anillo, si el que murio, era el lider mando a eleccion, sino solo actualizo
+
+/// tratamos de curar la red de anillo, si el que murio, era el lider mando a eleccion, sino solo actualizo
 impl Handler<HealRing> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: HealRing, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; } 
         let dead_addr = msg.dead_addr;
+        // me fijo si el nodo muerto es líder o no
         let was_leader = self.leader.as_ref().map_or(false, |l| l.addr == dead_addr);
 
-        self.is_electing = false; 
+        self.is_electing = false; // Declaramos que no estamos en elección 
         
         let mut sorted = self.known_stations.clone();
         sorted.sort_by_key(|s| s.station_id);
         let my_id = self.station_id;
         let self_addr = ctx.address();
-        let dead_list = self.logically_dead.clone(); // NUEVO
+        let dead_list = self.logically_dead.clone();
 
         ctx.spawn(async move {
+            // Buscamos nuestro priopio ID en la lista de estaciones 
             if let Some(my_idx) = sorted.iter().position(|s| s.station_id == my_id) {
                 let n = sorted.len();
                 let mut found_any = false;
                 
                 for offset in 1..n {
+                    // Probamos circularmente para buscar una siguiente estación para conectarse
                     let target = &sorted[(my_idx + offset) % n];
+                    // Si la siguiente es la que está muerta o está en a lista de los no "vivos"
+                    // seguimos iterando
                     if target.addr == dead_addr || dead_list.contains(&target.addr) { continue; } 
                     
+                    // Si encuentro uno que no es la estación que está muerta tampoco está en la lista
+                    // de los nodos muertos, intetamos la conexión 
                     if TcpStream::connect(&target.addr).await.is_ok() {
+                        // Si logramos conectar, autoenviamos actualización del siguiente nodo
+                        // poniendo como siguiente a este nodo vivo 
                         self_addr.do_send(UpdateNextNode(target.addr.clone()));
                         found_any = true;
                         break;
@@ -813,8 +896,11 @@ impl Handler<HealRing> for StationActor {
                 }
                 
                 if !found_any {
+                    // Si no encontramos nada, signfica que estamos solo
+                    // autoproclamamos líder
                     self_addr.do_send(DeclareSelfLeader);
                 } else if was_leader {
+                    // Si el nodo muerto era el líder, debemos arrancar elección 
                     println!("Lider caído detectado arranco eleccion.");
                     self_addr.do_send(StartElection);
                 }
@@ -822,17 +908,20 @@ impl Handler<HealRing> for StationActor {
         }.into_actor(self));
     }
 }
-///Eleecion en red de anillo
+/// Elección en red de anillo
 impl Handler<StartElection> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: StartElection, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
-        if self.is_electing { return; }
-        self.is_electing = true;
+        if self.is_disconnected { return; } // Si estoy desconectado, no elijo líder
+        if self.is_electing { return; } // Si ya estoy eligiendo, no disparo otra
+        self.is_electing = true; // Declaro estar en elección 
         
+        // Si tengo siguiente 
         if let Some(next_addr) = &self.next_station_addr {
             let target = next_addr.clone();
+            // Mandamos mensajes de RingElection a la siguiente 
             let msg = TcpMessage::RingElection { active_nodes: vec![self.station_id] };
+            // Enviamos el mensaje de elección a la siguiente 
             ctx.spawn(async move {
                 let _ = Self::send_tcp(target, msg).await;
             }.into_actor(self));
@@ -840,13 +929,18 @@ impl Handler<StartElection> for StationActor {
     }
 }
 
+/// Handleo del mensaje de RingElection 
 impl Handler<ProcessRingElection> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessRingElection, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; } 
+        // Nos agarramos el primer parámetro que nos entregan que tiene todos los IDs
+        // cola de todos los nodos que han ecolado su IDs
         let mut active_nodes = msg.0;
         if !self.is_electing { self.is_electing = true; }
 
+        // Comparamos nuestro ID con el primer ID de la cola, si son iguales 
+        // significa que el mensaje de elección ya dio toda la vuelta y se deja de propagar
         if active_nodes[0] == self.station_id {
             let leader_id = *active_nodes.iter().max().unwrap();
             let leader_info = self.known_stations.iter().find(|s| s.station_id == leader_id).unwrap();
@@ -855,7 +949,7 @@ impl Handler<ProcessRingElection> for StationActor {
             self.set_leader(leader_id, leader_addr.clone());
             ctx.address().do_send(ReplayPendingEvents);
 
-            //El nuevo líder pide explícitamente a la red que envíe todos sus eventos pendientes 
+            // El nuevo líder pide explícitamente a la red que envíe todos sus eventos pendientes 
             // para poder reconstruir el registro global de viajes perdidos.
             if let Some(next) = &self.next_station_addr {
                 let target = next.clone();
@@ -865,10 +959,12 @@ impl Handler<ProcessRingElection> for StationActor {
                 }.into_actor(self));
             }
 
+            // Le avisa al siguiente el mensaje de RingElected
             if let Some(next) = &self.next_station_addr {
                 let target = next.clone();
                 let initiator = self.station_id;
                 ctx.spawn(async move {
+                    // Quien inició la elección manda RingElected
                     let _ = Self::send_tcp(target, TcpMessage::RingElected { 
                         active_nodes, leader_id, leader_addr, initiator_id: initiator 
                     }).await;
@@ -879,6 +975,8 @@ impl Handler<ProcessRingElection> for StationActor {
             active_nodes.push(self.station_id);
             if let Some(next) = &self.next_station_addr {
                 let target = next.clone();
+                // Si no estoy en la lista significa que es la primera vez que me llegue el mensaje 
+                // entonces encolo mi ID y se lo mando a mi siguiente 
                 ctx.spawn(async move {
                     let _ = Self::send_tcp(target, TcpMessage::RingElection { active_nodes }).await;
                 }.into_actor(self));
@@ -887,17 +985,24 @@ impl Handler<ProcessRingElection> for StationActor {
     }
 }
 
+/// Handleo del mensaje RingElected
 impl Handler<ProcessRingElected> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessRingElected, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; } 
+
+        // Si fui quien inició la elección, termino 
         if msg.initiator_id == self.station_id {
             return;
         }
 
+        // Seteo el nuevo líder 
         self.set_leader(msg.leader_id, msg.leader_addr.clone());
+        // Si me caí, me volví a conectar, ya tengo el líder
+        // vuelvo a enviar los eventos pendientes
         ctx.address().do_send(ReplayPendingEvents);
 
+        // Si tenemos siguite, propagamos RingElected al siguiente. 
         if let Some(next) = &self.next_station_addr {
             let target = next.clone();
             ctx.spawn(async move {
@@ -1172,9 +1277,9 @@ impl Handler<HandleIncomingTcp> for StationActor {
 }
 
 
-//Funciones auxiliares
+/// Funciones auxiliares
 
-///fucnion para procesar y leer los archivos de configuracion para armar la estacion
+/// Función para procesar y leer los archivos de configuracion para armar la estacion
 fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
     let contents = fs::read_to_string(path).unwrap_or_else(|_| {
         eprintln!("Error: Imposible acceder al archivo de configuracion: '{}'", path);
@@ -1209,7 +1314,7 @@ fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
 // podrá reenviar los eventos pendientes (como viajes activos) y recuperar el estado global.
 fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>) -> (Vec<u32>, u32, VecDeque<StationEvent>) {
     let mut event_counter = 1;
-    //usamos un mapa para ir guardando y borrando los eventos según el log
+    // Usamos un mapa para ir guardando y borrando los eventos según el log
     let mut pending_events_map: HashMap<u32, StationEvent> = HashMap::new();
     
     if let Ok(contents) = fs::read_to_string(log_path) {
@@ -1231,7 +1336,7 @@ fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>) -> 
                     event_counter += 1;
                 }
             } 
-            //Recuperación de eventos pendientes.
+            // Recuperación de eventos pendientes.
             // Si leemos un ADD, convertimos el JSON de texto a la estructura StationEvent y la guardamos
             else if let Some(idx) = line.find("PENDING_EVENT_ADD: ") {
                 let json_str = &line[idx + "PENDING_EVENT_ADD: ".len()..];
@@ -1280,6 +1385,7 @@ async fn main() -> std::io::Result<()> {
     let config_path = &args[3];
 
     let known_stations = load_stations_from_config(config_path);
+    // Se busca a sí mismo y se clona su propio StationInfo
     let self_station = known_stations.iter().find(|s| s.station_id == station_id).unwrap_or_else(|| {
         eprintln!("Error: ID {} no localizado en red configurada.", station_id);
         std::process::exit(1);
@@ -1294,6 +1400,7 @@ async fn main() -> std::io::Result<()> {
     let log_path = PathBuf::from(format!("station_{}.log", port));
     
     // Desestructuramos la tupla ampliada que ahora también trae los `recovered_pending_events`
+    // Nos fijamos de las bicis iniciales cuáles tenemos de acuerdo al log
     let (recovered_bikes, recovered_event_counter, recovered_pending_events) = recover_state_from_log(&log_path, initial_bikes);
 
     let station_actor = StationActor {
@@ -1308,7 +1415,9 @@ async fn main() -> std::io::Result<()> {
         payment_gateway: gateway,
         pending_events: recovered_pending_events, //Inicializamos la cola con los eventos recuperados desde el log
         pending_payments: VecDeque::new(),
-        active_trips: HashMap::new(),
+        active_trips: HashMap::new(), // Solamente si la estación es líder
+        // Cuando la red muere, puede pasar que me llegue un evento de Return que no matchea 
+        // en la recuperación. Un Return Huérfanos que no tiene el evento de Rent
         orphan_returns: HashMap::new(),
         log_path: PathBuf::from(format!("station_{}.log", port)),
         is_electing: false,
@@ -1328,6 +1437,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    // Reader de la consola 
     let actor_for_stdin = station_actor.clone();
     tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
@@ -1347,6 +1457,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    // Cuando le mandemos ctrl + c se mata
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
