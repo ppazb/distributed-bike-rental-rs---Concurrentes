@@ -181,6 +181,8 @@ struct ProcessPayment {
     reply_to: Option<tokio::sync::mpsc::Sender<bool>>,
 }
 
+///Recibe un pago, se conecta con el banco via tcp, y le delega este pago
+/// informa por el channel si fue exitoso o no
 impl Handler<ProcessPayment> for PaymentGateway {
     type Result = ();
     fn handle(&mut self, msg: ProcessPayment, _ctx: &mut Self::Context) -> Self::Result {
@@ -271,7 +273,7 @@ impl StationActor {
         }
     }
 
-    ///Helper para enviar pagos y esperar respuesta
+    /// funcion auxiliar para enviar pagos y esperar de manera asincrona
     async fn send_payment(gateway: Addr<PaymentGateway>, payment: PaymentMethod, amount: f64, user_id: u32, station_id: u32) -> bool {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         gateway.do_send(ProcessPayment { payment, amount, user_id, station_id, reply_to: Some(tx) });
@@ -512,7 +514,7 @@ impl Handler<ExecReturn> for StationActor {
 impl Handler<ReceiveAck> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ReceiveAck, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; }
         let event_id = msg.0;
         
         let event_opt = self.pending_events.iter().find(|e| match e {
@@ -571,7 +573,7 @@ impl Handler<ReceiveClosedTrip> for StationActor {
         println!("[Estacion] Notificación del líder recibida. Viaje de bici {} cerrado globalmente.", msg.0);
     }
 }
-
+///Encolo el pago pendiente en la cola
 impl Handler<EnqueueFailedPayment> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: EnqueueFailedPayment, _ctx: &mut Self::Context) -> Self::Result {
@@ -676,7 +678,7 @@ impl Handler<ExecuteReplay> for StationActor {
 impl Handler<RequestPendingEventsMsg> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: RequestPendingEventsMsg, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; }
         // Si el mensaje dio la vuelta y llegó al líder que lo originó, se descarta.
         // Si yo fui la estación que originé el mensaje termino, no hago nada
         if msg.origin_addr == self.addr { return; }
@@ -731,10 +733,12 @@ impl Handler<ConsoleQueryTrips> for StationActor {
     }
 }
 
+///Handleo el mensaje de pedido de viajes, si soy el lider tengo la fuete de la verdad
+/// sino , si el mensaje tiene "tiempo de vida" (ttl) propago el pedido a mi siguiente
 impl Handler<ProcessQueryTrips> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessQueryTrips, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_electing || self.is_disconnected { return; } // NUEVO
+        if self.is_electing || self.is_disconnected { return; }
         
         let is_leader = self.leader.as_ref().map_or(false, |l| l.station_id == self.station_id);
         if is_leader {
@@ -764,7 +768,7 @@ impl Handler<ProcessQueryTrips> for StationActor {
 impl Handler<SetLeaderMsg> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: SetLeaderMsg, ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; }
         self.set_leader(msg.leader_id, msg.leader_addr);
         ctx.address().do_send(ReplayPendingEvents);
     }
@@ -773,12 +777,12 @@ impl Handler<SetLeaderMsg> for StationActor {
 impl Handler<UpdateNextNode> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: UpdateNextNode, _ctx: &mut Self::Context) -> Self::Result {
-        if self.is_disconnected { return; } // NUEVO
+        if self.is_disconnected { return; }
         self.next_station_addr = Some(msg.0.clone());
         println!("[Red] Enlace establecido hacia: {}", msg.0);
     }
 }
-/// Me autodeclaro lider, porque o bien gane la eleccion o bien estoy solo
+/// Me autodeclaro lider, porque estoy solo o quede solo
 impl Handler<DeclareSelfLeader> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: DeclareSelfLeader, ctx: &mut Self::Context) -> Self::Result {
@@ -928,7 +932,9 @@ impl Handler<StartElection> for StationActor {
     }
 }
 
-/// Handleo del mensaje de RingElection 
+/// Handleo del mensaje de RingElection, si yo arranque la eleccion, entonces pegue toda la vuelta por lo tanto
+/// agarro el id mas alto, seteo al nuevo lider, relanzo los eventos pendientes y propago la decision, enviando
+/// a mi siguiente ringelected para comenzar a actualizar la red
 impl Handler<ProcessRingElection> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessRingElection, ctx: &mut Self::Context) -> Self::Result {
@@ -984,7 +990,9 @@ impl Handler<ProcessRingElection> for StationActor {
     }
 }
 
-/// Handleo del mensaje RingElected
+/// Proceso las decision de eleccion, si yo arranque y recibi el mensaje termino
+/// sino, actualizo este nuevo lider, le envio los pendientes para reconstruir
+/// y propagamos la decision
 impl Handler<ProcessRingElected> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: ProcessRingElected, ctx: &mut Self::Context) -> Self::Result {
@@ -1016,6 +1024,8 @@ impl Handler<ProcessRingElected> for StationActor {
     }
 }
 
+///Si hay algun pago pendiente en la cola de pagos, intento enviar al actor payment gatwayt
+/// si es exitoso, lo desencolo, sino me envio el mensaje de que fallo y lo vuelvo a encolar
 impl Handler<RetryPendingPayments> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: RetryPendingPayments, ctx: &mut Self::Context) -> Self::Result {
@@ -1059,6 +1069,8 @@ impl Handler<ConsoleDisconnect> for StationActor {
     }
 }
 
+///Volvemos a conectar la estacion a la red, y avisamos a los demas nodos que volvemos a estar 
+/// vivos
 impl Handler<ConsoleConnect> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: ConsoleConnect, ctx: &mut Self::Context) -> Self::Result {
@@ -1098,6 +1110,7 @@ impl Handler<RegisterDeadNode> for StationActor {
     }
 }
 
+///Actualizo el nodo que estaba simulando desconexion que se acaba de volver a conectar
 impl Handler<RegisterAliveNode> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: RegisterAliveNode, _ctx: &mut Self::Context) -> Self::Result {

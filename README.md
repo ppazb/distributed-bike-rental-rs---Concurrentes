@@ -345,3 +345,236 @@ El usuario calcula la distancia a la estación y se conecta a la estación más 
 
 
 [![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/KujF6lFv)
+
+___
+# Cambios entrega final
+Luego de la pre entrega y las charlas realizadas con el corrector. Se detectaron algunos problemas centrales en el diseño, por ejemplo la falta de un binario extra como la entidad "banco".
+Ademas encontramos la falta de uno de los requerimientos: la simulacion de red caida.
+Ademas durante el desarrollo encontramos multiples bugs o errores en la forma de encarar el problema que dejaban al sistema en un estado inestable.
+
+Para corregir esto se agregan mensajes, actores y se expanden los actores ya presentes.
+
+## Actores
+### Estacion
+```
+struct StationActor {
+    station_id: u32, //Id para identificar cada estacion de manera unica, para la estructura de anillo
+    addr: String, //Direccion de la estacion
+    location: (usize, usize),//representa la ubicacion
+    max_slots: usize,//cantidad de slot maxima de bicicleta
+    available_bikes: Vec<u32>, // bicicletas en la estacion
+    leader: Option<StationInfo>,//Option de la estacion lider, porque puede no tener referencia
+    known_stations: Vec<StationInfo>,//todas las estaciones conocidas
+    next_station_addr: Option<String>, //mi vecino en el anillo
+    payment_gateway: Addr<PaymentGateway>,//direccion del metodo de pago
+    pending_events: VecDeque<StationEvent>,//cola de eventos pendientes para sincronizacion
+    pending_payments: VecDeque<(PaymentMethod, f64, u32, u32)>,//cola de pagos pendientes para futuro cobro (payment, amount, user_id, station_id)
+    active_trips: HashMap<u32, TripInfo>, // viajes abiertos,para mantener vision global de la red, solo el lider la usa
+    orphan_returns: HashMap<u32, (String, StationEvent)>,//hashmap para devoluciones que llegaron al líder antes que el aviso de alquiler (por lag)
+    log_path: PathBuf,//path del archivo para escribir el log de la estacion
+    is_electing: bool,//si se esta en una eleccion de lider actualmente
+    event_counter: u32,//contador de eventos para generar eventos unicos
+    is_disconnected: bool, // Determina si la estación debe ignorar los eventos de anillo
+    logically_dead: Vec<String>, // Lista de nodos que avisaron que se desconectaron, para no pingearlos
+}
+```
+### Mensajes Estacion
+```
+Asumimos que no estoy solo en la red e intento unirme a la red de forma natural, le pregunto a mi vecino quién es el lider y actualizo. Si nadie me responde, significa que estoy solo y me autoproclamo líder
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Bootup;
+
+Si pasó el tiempo y todavía no tenemos lider, es decir es None y además no estamos en elección lanzamos elección para elegir un nuevo líder
+#[derive(Message)]
+#[rtype(result = "()")]
+struct VerifyLeaderTimeout;
+
+Comienzo la elección en el anillo, y propago esta decision a mi vecino
+#[derive(Message)]
+#[rtype(result = "()")]
+struct StartElection;
+
+handleo de los mensajes recibidos por TCP, escucho por el socket y proceso la respuesta en base al mensaje recibido, desvio en el caso correspondiente, renta, devolucion, sincronizar, ack,etc, Autoenviandome el mensaje correspondiente. Es el nexo entre estaciones
+#[derive(Message)]
+#[rtype(result = "()")]
+struct HandleIncomingTcp(TcpStream);
+
+Si hay algun pago pendiente en la cola de pagos, intento enviar al actor payment gatwayt si es exitoso, lo desencolo, sino me envio el mensaje de que fallo y lo vuelvo a encolar
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RetryPendingPayments;
+
+Encolo el pago pendiente en la cola
+#[derive(Message)]
+#[rtype(result = "()")]
+struct EnqueueFailedPayment {
+    payment: PaymentMethod,
+    amount: f64,
+    user_id: u32,
+    station_id: u32,
+}
+
+Handleo de la operación de rentar una bici, actualizando todos los atributos del actor, encolando los eventos y avisando al líder de la transacción
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ExecRent {
+    user_id: u32,
+    bike_id: u32,
+}
+
+Handleo de la operación de retorno de bici, encola el evento pendiente, y avisa al líder que la operación termino.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ExecReturn {
+    user_id: u32,
+    bike_id: u32,
+    start_time: chrono::DateTime<chrono::Utc>,
+    payment: PaymentMethod,
+}
+
+Handleo para setear el lider, luego lanzo tarea para rejecutar los eventos pendientes,ya que como se llavo a setear lider, este cambio y por lo tanto tenemos que sincronizar
+#[derive(Message)]
+#[rtype(result = "()")]
+struct SetLeaderMsg {
+    leader_id: u32,
+    leader_addr: String,
+}
+
+Pruebo si mi siguiente normal (es decir mi id +1), esta vivo, si lo esta y me contesta, pero no era mi siguiente quiere decir que se callo por lo tanto lo vuelvo a incluir, si no esta vivo, mando mensaje a su siguiente y asi, hasta actualizar mi nuevo vecino, si mi vecino era el lider, llamo a eleccion
+#[derive(Message)]
+#[rtype(result = "()")]
+struct CheckNeighborHealth;
+
+tratamos de curar la red de anillo, si el que murio, era el lider mando a eleccion, sino solo actualizo mi vecino
+#[derive(Message)]
+#[rtype(result = "()")]
+struct HealRing {
+    dead_addr: String,
+}
+
+Actualizo mi vecino
+#[derive(Message)]
+#[rtype(result = "()")]
+struct UpdateNextNode(String);
+
+Me autodeclaro lider, porque estoy solo o quede solo
+#[derive(Message)]
+#[rtype(result = "()")]
+struct DeclareSelfLeader;
+
+Si soy el lider muestro el registro global de viajes, si no lo soy paso el mensaje a mi siguiente de esta forma siempre tenemos al lider como actor de la verdad
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ConsoleQueryTrips;
+
+Handleo de mensaje para mantener sincronizada la red, el lider mantiene actualizado el estado global del sistema, si el lider arranca en blaco por ejemplo por una nueva votacion tengo que reconstruir todo los eventos pendientes, lanzo ráfaga de mensajes para ello
+#[derive(Message)]
+#[rtype(result = "()")]
+struct SyncEventToLeader {
+    origin_addr: String,
+    event: StationEvent,
+}
+
+Hanldeo de los ACK, respuestas del lider a los avisos de recibidos. busca el id del evento que matchee el que se recibio,verifica que el lider haya confirmado la devolucion y por lo tanto puedo generar la informacion de cobro y luego lanzar una tarea para verificar que e pago se complete o no, si falla encolo a los pagos pendientes. Cuando se confirma, se elimina de la cola
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ReceiveAck(u32);
+
+Hadleo del aviso que el viaje cerró, por lo tanto ya puedo eliminar el viaje de mi cola
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ReceiveClosedTrip(u32);
+
+Handle para comenzar a reconstruir los eventos pendientes
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ReplayPendingEvents;
+
+Sincronizamos eventos pendientes de pending_events de la estación con el líder 
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ExecuteReplay;
+
+
+Handleo del mensaje de RingElection, si yo arranque la eleccion, entonces pegue toda la vuelta por lo tanto agarro el id mas alto, seteo al nuevo lider, relanzo los eventos pendientes y propago la decision, enviando a mi siguiente ringelected para comenzar a actualizar la red
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ProcessRingElection(Vec<u32>);
+
+Proceso las decision de eleccion, si yo arranque y recibi el mensaje termino sino, actualizo este nuevo lider, le envio los pendientes para reconstruir y propagamos la decision
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ProcessRingElected {
+    active_nodes: Vec<u32>,
+    leader_id: u32,
+    leader_addr: String,
+    initiator_id: u32,
+}
+
+/// Si recibimos el mensaje WhoIsLeader y tengo algún líder, repondo la inforamción del líder
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ProcessWhoIsLeader(String);
+
+Handleo el mensaje de pedido de viajes, si soy el lider tengo la fuete de la verdad sino , si el mensaje tiene "tiempo de vida" (ttl) propago el pedido a mi siguiente
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ProcessQueryTrips {
+    origin_addr: String,
+    ttl: usize,
+}
+
+Responde a la petición del nuevo líder forzando a la estación a vaciar su cola de pendientes
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RequestPendingEventsMsg {
+    origin_addr: String,
+    ttl: usize,
+}
+
+Permite aislar a la estación avisando al resto del anillo, mientras sigue atendiendo clientes. De esta forma se simula la desconexion de la red, pero permitiendo el funcionamiento con el usuario
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ConsoleDisconnect;
+
+Volvemos a conectar la estacion a la red, y avisamos a los demas nodos que volvemos a estar  vivos
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ConsoleConnect;
+
+Estos comandos son los que reciben los vecinos cuando la estación avisa que se desconectó
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RegisterDeadNode(String);
+
+Actualizo el nodo que estaba simulando desconexion que se acaba de volver a conectar
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RegisterAliveNode(String);
+```
+### PaymentGateway
+Actor encargado de la comunicacion con el binario banco, para delegar los pagos y que este los "procese".
+Comunica a la estacion si el banco respondio ok o error.
+```
+struct PaymentGateway {
+    bank_addr: String,
+}
+
+impl Actor for PaymentGateway {
+    type Context = Context<Self>;
+}
+
+
+///Recibe un pago, se conecta con el banco via tcp, y le delega este pago
+/// informa por el channel si fue exitoso o no
+#[derive(Message)]
+#[rtype(result = "()")]
+struct ProcessPayment {
+    payment: PaymentMethod,
+    amount: f64,
+    user_id: u32,
+    station_id: u32,
+    reply_to: Option<tokio::sync::mpsc::Sender<bool>>,
+}
+```
