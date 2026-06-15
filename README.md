@@ -833,6 +833,11 @@ pub enum TcpMessage {
     },
 }
 ```
+## Casos de uso
+### 1 station y 1 user
+Lanzo un binario station, el cual desde el archivo de config + los argumentos seteara todo lo necesario para el actor station, que se levantar en el binario.
+Desde este momento, cuando el actor inicie y chequee su siguiente director y posteriormente las demas estaciones se dara cuenta que esta solo, por lo tanto se autoproclama lider.
+Ahora lanzamos el binario cliente, este con el archivo de configuracion 
 ## Metodo de uso
 **Importante antes de querer ejecutar el sistema, si se quiere comenzar una simulacion desde 0 es fundamental borrar los log del sistema, puesto que sino el sistema buscara reconstruir el ultimo estado online.**
 Para poder usar la aplicacion se debe ejecutar en cada terminar una estacion diferente.

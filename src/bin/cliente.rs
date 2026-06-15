@@ -32,7 +32,7 @@ async fn main() {
     let reconstructed_current_trip = recover_state_from_log(&new_log_path).await; 
 
     let mut user = UserClient {
-        user_id: 1,
+        user_id: id,
         location: Location { location: (x, y) },
         known_stations,
         payment_method: PaymentMethod::CreditCard("4512-4412-1102-8854".into()),
