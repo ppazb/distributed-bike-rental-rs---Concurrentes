@@ -13,6 +13,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+const BANK_ADDR: &str = "127.0.0.1:4000";
+
 //Declaracion de mesajes de actor estacion
 
 #[derive(Message)]
@@ -40,6 +42,8 @@ struct RetryPendingPayments;
 struct EnqueueFailedPayment {
     payment: PaymentMethod,
     amount: f64,
+    user_id: u32,
+    station_id: u32,
 }
 
 #[derive(Message)]
@@ -161,7 +165,7 @@ struct RegisterAliveNode(String);
 
 //Mensajes paymentGateway (Pendiente de implementar)
 struct PaymentGateway {
-    _log_path: PathBuf,
+    bank_addr: String,
 }
 
 impl Actor for PaymentGateway {
@@ -169,17 +173,70 @@ impl Actor for PaymentGateway {
 }
 
 #[derive(Message)]
-#[rtype(result = "bool")]
+#[rtype(result = "()")]
 struct ProcessPayment {
-    _payment: PaymentMethod,
-    _amount: f64,
+    payment: PaymentMethod,
+    amount: f64,
+    user_id: u32,
+    station_id: u32,
+    reply_to: Option<tokio::sync::mpsc::Sender<bool>>,
 }
 
 impl Handler<ProcessPayment> for PaymentGateway {
-    type Result = bool;
-    fn handle(&mut self, _msg: ProcessPayment, _ctx: &mut Self::Context) -> Self::Result {
-        //loguear al archivo del actor payment
-        true
+    type Result = ();
+    fn handle(&mut self, msg: ProcessPayment, _ctx: &mut Self::Context) -> Self::Result {
+        let reply_to = msg.reply_to.clone();
+        let bank_addr = self.bank_addr.clone();
+
+        tokio::spawn(async move {
+            let payment = msg.payment;
+            let amount = msg.amount;
+            let user_id = msg.user_id;
+            let station_id = msg.station_id;
+
+            // construyo mensaje
+            let payload = match serde_json::to_string(&serde_json::json!({ "payment": payment, "amount": amount, "user_id": user_id, "station_id": station_id })) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[PaymentGateway] Error al serializar pago para banco: {}", e);
+                    if let Some(tx) = reply_to { let _ = tx.send(false).await; }
+                    return;
+                }
+            };
+
+            // conecto al banco
+            let result = match TcpStream::connect(bank_addr.clone()).await {
+                Ok(mut stream) => {
+                    if let Err(e) = stream.write_all(format!("{}\n", payload).as_bytes()).await {
+                        eprintln!("[PaymentGateway] Error al enviar pago al banco: {}", e);
+                        false
+                    } else {
+                        let mut reader = BufReader::new(stream);
+                        let mut resp = String::new();
+                        if let Ok(_) = reader.read_line(&mut resp).await {
+                            let resp_trim = resp.trim();
+                            if resp_trim == "true" {
+                                true
+                            } else {
+                                //caso no deberia existir: el banco responde siempre true a menos q se envie formato equivocado
+                                eprintln!("[PaymentGateway] Pago rechazado por el banco.");
+                                false
+                            }
+                        } else {
+                            eprintln!("[PaymentGateway] Error al leer respuesta del banco.");
+                            false
+                        }
+                    }
+                }
+                //va a ocurrir cuando esta desconectado el banco
+                Err(e) => {
+                    eprintln!("[PaymentGateway] Error al conectar con el banco {}: {}", bank_addr, e);
+                    false
+                }
+            };
+
+            if let Some(tx) = reply_to { let _ = tx.send(result).await; }
+        });
     }
 }
 
@@ -196,7 +253,7 @@ struct StationActor {
     next_station_addr: Option<String>, //mi vecino en el anillo
     payment_gateway: Addr<PaymentGateway>,//direccion del metodo de pago
     pending_events: VecDeque<StationEvent>,//cola de eventos pendientes para sincronizacion
-    pending_payments: VecDeque<(PaymentMethod, f64)>,//cola de pagos pendientes para futuro cobro
+    pending_payments: VecDeque<(PaymentMethod, f64, u32, u32)>,//cola de pagos pendientes para futuro cobro (payment, amount, user_id, station_id)
     active_trips: HashMap<u32, TripInfo>, // viajes abiertos,para mantener vision global de la red, solo el lider la usa
     orphan_returns: HashMap<u32, (String, StationEvent)>,//hashmap para devoluciones que llegaron al líder antes que el aviso de alquiler (por lag)
     log_path: PathBuf,//path del archivo para escribir el log de la estacion
@@ -212,6 +269,12 @@ impl StationActor {
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.log_path) {
             let _ = writeln!(file, "[{}] {}", chrono::Utc::now(), event_desc);
         }
+    }
+    ///Helper para enviar pagos y esperar respuesta
+    async fn send_payment(gateway: Addr<PaymentGateway>, payment: PaymentMethod, amount: f64, user_id: u32, station_id: u32) -> bool {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        gateway.do_send(ProcessPayment { payment, amount, user_id, station_id, reply_to: Some(tx) });
+        rx.recv().await.unwrap_or(false)
     }
     ///Funcion asyncrona para enviar los mensajes a otra estacion partiendo de formato json, usa serde
     /// para serializar y enviar el por el TCP socket de tokio
@@ -412,17 +475,17 @@ impl Handler<ReceiveAck> for StationActor {
             _ => false,
         }).cloned();
 
-        if let Some(StationEvent::BikeReturned { start_time, return_time, payment_method, bike_id, .. }) = event_opt {
+        if let Some(StationEvent::BikeReturned { start_time, return_time, payment_method, bike_id, user_id, station_id, .. }) = event_opt {
             let duration = (return_time - start_time).num_minutes() as f64;
-            let amount = duration * 10.0;
+            let amount = 10.0 + duration * 10.0;
             
             let gateway = self.payment_gateway.clone();
             let self_addr = ctx.address();
             
             ctx.spawn(async move {
-                let success = gateway.send(ProcessPayment { _payment: payment_method.clone(), _amount: amount }).await.unwrap_or(false);
+                let success = StationActor::send_payment(gateway, payment_method.clone(), amount, user_id, station_id).await;
                 if !success {
-                    self_addr.do_send(EnqueueFailedPayment { payment: payment_method, amount });
+                    self_addr.do_send(EnqueueFailedPayment { payment: payment_method, amount, user_id, station_id });
                 }
             }.into_actor(self));
             
@@ -465,7 +528,7 @@ impl Handler<ReceiveClosedTrip> for StationActor {
 impl Handler<EnqueueFailedPayment> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: EnqueueFailedPayment, _ctx: &mut Self::Context) -> Self::Result {
-        self.pending_payments.push_back((msg.payment, msg.amount));
+        self.pending_payments.push_back((msg.payment, msg.amount, msg.user_id, msg.station_id));
         self.log_event("PAYMENT_PENDING_ENQUEUED");
     }
 }
@@ -852,13 +915,15 @@ impl Handler<ProcessRingElected> for StationActor {
 impl Handler<RetryPendingPayments> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: RetryPendingPayments, ctx: &mut Self::Context) -> Self::Result {
-        if let Some((method, amount)) = self.pending_payments.pop_front() {
+        if let Some((method, amount, user_id, station_id)) = self.pending_payments.pop_front() {
             let gateway = self.payment_gateway.clone();
             let self_addr = ctx.address();
             ctx.spawn(async move {
-                let success = gateway.send(ProcessPayment { _payment: method.clone(), _amount: amount }).await.unwrap_or(false);
-                if !success {
-                    self_addr.do_send(EnqueueFailedPayment { payment: method, amount });
+                let success = StationActor::send_payment(gateway, method.clone(), amount, user_id, station_id).await;
+                if success {
+                    println!("[Estación] Pago pendiente procesado exitosamente para usuario {} en estación {} por ${}.", user_id, station_id, amount);
+                } else {
+                    self_addr.do_send(EnqueueFailedPayment { payment: method, amount, user_id, station_id });
                 }
             }.into_actor(self));
         }
@@ -1025,11 +1090,17 @@ impl Handler<HandleIncomingTcp> for StationActor {
                         }
                         
                         TcpMessage::RentBike { user_id, bike_id, payment_method } => {
-                            let auth = gateway.send(ProcessPayment { _payment: payment_method, _amount: 500.0 }).await.unwrap_or(false);
-                            if auth && bikes.contains(&bike_id) {
+    
+                            if bikes.contains(&bike_id) {
+                                let auth = StationActor::send_payment(gateway.clone(), payment_method, 500.0, user_id, station_id).await;
+                                if auth {
                                 self_addr.do_send(ExecRent { user_id, bike_id });
                                 let resp = TcpMessage::RentResponse { success: true, message: "Alquiler Consolidado".into() };
                                 let _ = stream.write_all((serde_json::to_string(&resp).unwrap() + "\n").as_bytes()).await;
+                                }else{
+                                    let resp = TcpMessage::RentResponse { success: false, message: "Banco fuera de servicio".into() };
+                                    let _ = stream.write_all((serde_json::to_string(&resp).unwrap() + "\n").as_bytes()).await;
+                                }
                             } else {
                                 let resp = TcpMessage::RentResponse { success: false, message: "Denegado o falta stock".into() };
                                 let _ = stream.write_all((serde_json::to_string(&resp).unwrap() + "\n").as_bytes()).await;
@@ -1215,7 +1286,8 @@ async fn main() -> std::io::Result<()> {
     }).clone();
 
     let port = self_station.addr.split(':').last().unwrap();
-    let gateway = PaymentGateway { _log_path: PathBuf::from(format!("gateway_{}.log", port)) }.start();
+    let bank_addr = BANK_ADDR.to_string();
+    let gateway = PaymentGateway { bank_addr }.start();
     let start = 1 + max_slots as u32 * (station_id - 1);
     let end = station_id * max_slots as u32;
     let initial_bikes: Vec<u32> = (start..=end).collect();

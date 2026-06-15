@@ -115,7 +115,7 @@ impl UserClient {
         reader.read_line(&mut line).await.unwrap();
 
         // Validamos la confirmación del servidor
-        if let Ok(TcpMessage::RentResponse { success, .. }) = serde_json::from_str(&line) {
+        if let Ok(TcpMessage::RentResponse { success, message }) = serde_json::from_str(&line) {
             if success {
                 let trip_id = self.trip_counter;
                 self.trip_counter += 1;
@@ -129,6 +129,8 @@ impl UserClient {
                 self.log_event(&format!("ACTIVE_TRIP: {}", serde_json::to_string(&current_trip).unwrap()));
                 self.current_trip = Some(current_trip);
                 return true;
+            }else{
+                println!("Alquiler denegado: {}", message);
             }
         }
         false
@@ -380,8 +382,6 @@ async fn main() {
                         let addr = station.addr.clone();
                         if user.rent_bike(&addr, bike_id, station).await {
                             println!("Alquiler completado Bici ID: {}", bike_id);
-                        } else {
-                            println!("Alquiler denegado");
                         }
                     } else {
                         println!("Estacion desconocida, lanzar get_bikes para ver la red");
