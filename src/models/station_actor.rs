@@ -1224,6 +1224,9 @@ impl Handler<HandleIncomingTcp> for StationActor {
                                                 // Si no logro conectarme a la siguiente devuelvo lo que tengo 
                                                 let _ = stream.write_all(serialized_fwd.as_bytes()).await;
                                             }
+                                        } else {
+                                            // Si estoy sola devuelvo lo que tengo también 
+                                            let _ = stream.write_all(serialized_fwd.as_bytes()).await;
                                         }
                             }
                         }
