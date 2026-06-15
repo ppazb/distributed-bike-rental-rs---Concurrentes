@@ -816,41 +816,56 @@ impl Handler<DeclareSelfLeader> for StationActor {
 /// Pruebo si mi siguiente normal (es decir mi id +1), esta vivo, si lo esta y me
 /// contesta, pero no era mi siguiente quiere decir que se callo
 /// por lo tanto lo vuelvo a incluir, si no esta vivo, mando mensaje a su siguiente y asi, hasta
-/// actualizar mi nuevo vecino, si mi vecino era el lider, llamo a eleccion
+/// actualizar mi nuevo vecino, si mi vecino era el lider, llamo a eleccion.
 impl Handler<CheckNeighborHealth> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: CheckNeighborHealth, ctx: &mut Self::Context) -> Self::Result {
+
         if self.is_disconnected { return; }
 
+        // Clonamos la dirección de nuestro vecino actual para usarla 
         let current_next = self.next_station_addr.clone();
         let self_addr = ctx.address();
-        
         let mut sorted = self.known_stations.clone();
         sorted.sort_by_key(|s| s.station_id);
+        
+        //Bucos mi id y mi posicion para calcular cual es mi siguiente ideal
         let my_idx = sorted.iter().position(|s| s.station_id == self.station_id).unwrap();
-        let ideal_next = &sorted[(my_idx + 1) % sorted.len()];
-        let ideal_addr = ideal_next.addr.clone();
-        let dead_list = self.logically_dead.clone(); // Evaluamos los nodos muertos simulados
-
+        let dead_list = self.logically_dead.clone(); 
         ctx.spawn(async move {
-            // Intentamos recuperar el anillo y se fija si está el siguiente ideal, si no está
-            // continúa con el siguiente original 
-            // Si mi ideal no es igual al siguiente de ahora no entra
-            if Some(ideal_addr.clone()) != current_next {
-                if !dead_list.contains(&ideal_addr) { 
-                    if TcpStream::connect(&ideal_addr).await.is_ok() {
-                        self_addr.do_send(UpdateNextNode(ideal_addr.clone()));
-                        return;
-                    }
+            let mut is_current_dead = false;
+            
+            if let Some(ref addr) = current_next {
+                //reviso si mi vecino, o bien esta simulando desconexion o bien esta muerto
+                if dead_list.contains(addr) || TcpStream::connect(addr).await.is_err() {
+                    is_current_dead = true;
+                    //si sucedio cualquiera de las 2 lanzo mensaje para curar red
+                    self_addr.do_send(HealRing { dead_addr: addr.clone() });
                 }
             }
-
-            // Intentamos conectarnos a nuestro current_next
-            if let Some(addr) = current_next {
-                // si current_next está en la lista de los nodos muertos o no logramos 
-                // conectarnos disparamos HealRing para reconstruir el anillo
-                if dead_list.contains(&addr) || TcpStream::connect(&addr).await.is_err() {
-                    self_addr.do_send(HealRing { dead_addr: addr });
+            if !is_current_dead {
+                let n = sorted.len();
+                
+                //iteramos desde el nodo siguiente al nuestro (offset = 1) hacia adelante
+                for offset in 1..n {
+                    // calculamos el indice usando módulo (%) para dar la vuelta al anillo si llegamos al final
+                    let candidate = &sorted[(my_idx + offset) % n];
+                    
+                    //si iterando llegamos al nodo que ya es nuestro vecino actual entonces
+                    //significa que no hay ningún nodo "en el medio" que haya revivido
+                    if Some(candidate.addr.clone()) == current_next {
+                        break;
+                    }
+                    // Si llegamos a esta linea, es porque hay un candidato que debería estar antes que nuestro vecino actual
+                    // revisamos si esta nuevo candidato no esta en la lista de los "simulados caidos"
+                    if !dead_list.contains(&candidate.addr) { 
+                        //nos intentamos conectar 
+                        if TcpStream::connect(&candidate.addr).await.is_ok() {
+                            // NOs enviamos el mensaje para actualizar mi siguiente puesto que lo encontramos
+                            self_addr.do_send(UpdateNextNode(candidate.addr.clone()));
+                            break;
+                        }
+                    }
                 }
             }
         }.into_actor(self));
