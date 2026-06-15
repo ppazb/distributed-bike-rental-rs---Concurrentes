@@ -853,7 +853,7 @@ Nos generara una estacion en el puerto 8001, otra en el 8002 y finalmente una en
 ___
 Luego es necesario levantar el bank:
 ```
-
+cargo run --bin bank
 ```
 
 ___
