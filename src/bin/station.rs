@@ -1,6 +1,6 @@
 use actix::prelude::*;
 use bici_concu::models::station_actor::*; 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
@@ -16,7 +16,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let station_id: u32 = args[1].parse().unwrap();
-    let max_slots: usize = args[2].parse().unwrap();
+    let mut max_slots: usize = args[2].parse().unwrap();
     let config_path = &args[3];
 
     let known_stations = load_stations_from_config(config_path);
@@ -33,10 +33,11 @@ async fn main() -> std::io::Result<()> {
     let end = station_id * max_slots as u32;
     let initial_bikes: Vec<u32> = (start..=end).collect();
     let log_path = PathBuf::from(format!("station_{}.log", port));
+    max_slots = max_slots + 3;
     
-    // Desestructuramos la tupla ampliada que ahora también trae los `recovered_pending_events`
+    // Desestructuramos la tupla ampliada que ahora también trae los recovered_pending_events y recovered_pending_payments
     // Nos fijamos de las bicis iniciales cuáles tenemos de acuerdo al log
-    let (recovered_bikes, recovered_event_counter, recovered_pending_events) = recover_state_from_log(&log_path, initial_bikes);
+    let (recovered_bikes, recovered_event_counter, recovered_pending_events, recovered_pending_payments) = recover_state_from_log(&log_path, initial_bikes);
 
     let station_actor = StationActor {
         station_id,
@@ -49,7 +50,7 @@ async fn main() -> std::io::Result<()> {
         next_station_addr: None,
         payment_gateway: gateway,
         pending_events: recovered_pending_events, //Inicializamos la cola con los eventos recuperados desde el log
-        pending_payments: VecDeque::new(),
+        pending_payments: recovered_pending_payments,
         active_trips: HashMap::new(), // Solamente si la estación es líder
         // Cuando la red muere, puede pasar que me llegue un evento de Return que no matchea 
         // en la recuperación. Un Return Huérfanos que no tiene el evento de Rent

@@ -577,8 +577,10 @@ impl Handler<ReceiveClosedTrip> for StationActor {
 impl Handler<EnqueueFailedPayment> for StationActor {
     type Result = ();
     fn handle(&mut self, msg: EnqueueFailedPayment, _ctx: &mut Self::Context) -> Self::Result {
-        self.pending_payments.push_back((msg.payment, msg.amount, msg.user_id, msg.station_id));
-        self.log_event("PAYMENT_PENDING_ENQUEUED");
+        self.pending_payments.push_back((msg.payment.clone(), msg.amount, msg.user_id, msg.station_id));
+        if let Ok(serialized) = serde_json::to_string(&(msg.payment, msg.amount, msg.user_id, msg.station_id)) {
+            self.log_event(&format!("PENDING_PAYMENT_ADD: {}", serialized));
+        }
     }
 }
 
@@ -1044,17 +1046,22 @@ impl Handler<ProcessRingElected> for StationActor {
 impl Handler<RetryPendingPayments> for StationActor {
     type Result = ();
     fn handle(&mut self, _msg: RetryPendingPayments, ctx: &mut Self::Context) -> Self::Result {
-        if let Some((method, amount, user_id, station_id)) = self.pending_payments.pop_front() {
+        if let Some((payment_method, amount, user_id, station_id)) = self.pending_payments.pop_front() {
             let gateway = self.payment_gateway.clone();
-            let self_addr = ctx.address();
+            let payment_method_clone = payment_method.clone();
+            let serialized = serde_json::to_string(&(payment_method.clone(), amount, user_id, station_id)).unwrap_or_default();
+
             ctx.spawn(async move {
-                let success = StationActor::send_payment(gateway, method.clone(), amount, user_id, station_id).await;
+                let success = StationActor::send_payment(gateway, payment_method.clone(), amount, user_id, station_id).await;
+                success
+            }.into_actor(self).map(move |success, actor, ctx| {
                 if success {
                     println!("[Estación] Pago pendiente procesado exitosamente para usuario {} en estación {} por ${}.", user_id, station_id, amount);
+                    actor.log_event(&format!("PENDING_PAYMENT_REMOVE: {}", serialized));
                 } else {
-                    self_addr.do_send(EnqueueFailedPayment { payment: method, amount, user_id, station_id });
+                    ctx.address().do_send(EnqueueFailedPayment { payment: payment_method_clone, amount, user_id, station_id });
                 }
-            }.into_actor(self));
+            }));
         }
     }
 }
@@ -1339,10 +1346,11 @@ pub fn load_stations_from_config(path: &str) -> Vec<StationInfo> {
 // Esto permite reconstruir la cola de eventos que la estación no llegó a sincronizar
 // con el líder antes de morir. De esta manera, al reconectarse a un nuevo líder, 
 // podrá reenviar los eventos pendientes (como viajes activos) y recuperar el estado global.
-pub fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>) -> (Vec<u32>, u32, VecDeque<StationEvent>) {
+pub fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>) -> (Vec<u32>, u32, VecDeque<StationEvent>, VecDeque<(PaymentMethod, f64, u32, u32)>) {
     let mut event_counter = 1;
     // Usamos un mapa para ir guardando y borrando los eventos según el log
     let mut pending_events_map: HashMap<u32, StationEvent> = HashMap::new();
+    let mut pending_payments_map: HashMap<String, (PaymentMethod, f64, u32, u32)> = HashMap::new();
     
     if let Ok(contents) = fs::read_to_string(log_path) {
         println!("[Estacion] Archivo de log encontrado. Reconstruyendo estado físico y eventos...");
@@ -1383,11 +1391,24 @@ pub fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>)
                     pending_events_map.remove(&ev_id);
                 }
             }
+            // Recuperación de pagos pendientes
+            else if let Some(idx) = line.find("PENDING_PAYMENT_ADD: ") {
+                let json_str = &line[idx + "PENDING_PAYMENT_ADD: ".len()..];
+                if let Ok(tuple) = serde_json::from_str::<(PaymentMethod, f64, u32, u32)>(json_str) {
+                    pending_payments_map.insert(json_str.to_string(), tuple);
+                }
+            } else if let Some(idx) = line.find("PENDING_PAYMENT_REMOVE: ") {
+                let json_str = &line[idx + "PENDING_PAYMENT_REMOVE: ".len()..];
+                pending_payments_map.remove(json_str.trim());
+            }
         }
         println!("[Estacion] Estado reconstruido. Bicicletas actuales: {:?}", available_bikes);
-        //Informar cuántos eventos pendientes se recuperaron
+        //Informar cuántos eventos y pagos pendientes se recuperaron
         if !pending_events_map.is_empty() {
             println!("[Estacion] Se recuperaron {} eventos pendientes de sincronizar.", pending_events_map.len());
+        }
+        if !pending_payments_map.is_empty() {
+            println!("[Estacion] Se recuperaron {} pagos pendientes para reintentar.", pending_payments_map.len());
         }
     } else {
         println!("[Estacion] No se encontró log previo. Iniciando con estado por defecto.");
@@ -1395,5 +1416,6 @@ pub fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>)
     
     // Convertimos el HashMap final a una cola VecDeque para devolverlo junto a las bicis
     let pending_events: VecDeque<StationEvent> = pending_events_map.into_values().collect();
-    (available_bikes, event_counter, pending_events)
+    let pending_payments: VecDeque<(PaymentMethod, f64, u32, u32)> = pending_payments_map.into_values().collect();
+    (available_bikes, event_counter, pending_events, pending_payments)
 }
