@@ -1,7 +1,7 @@
 use bici_concu::models::location::Location;
 use bici_concu::models::payment_method::PaymentMethod;
 use bici_concu::models::tcp_message::TcpMessage;
-use bici_concu::models::user_actor::*; 
+use bici_concu::models::user_client::*; 
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;

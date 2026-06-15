@@ -355,7 +355,12 @@ Ademas durante el desarrollo encontramos multiples bugs o errores en la forma de
 Para corregir esto se agregan mensajes, actores y se expanden los actores ya presentes.
 
 ## Actores
-### Estacion
+### Station
+Actor principal del sistema, permite asignarle una cantidad de bicis, y una capacidad maxima. Cada estacion se conecta con otra a traves de su vecino, por medio de su direcion:puerto en el archivo de configuracion.
+Cuando se dispone de varias estaciones vivas a la vez, esta se conectan por medio de topologia de anillo, referenciando a su vecino mas cercano.
+Cada estacion se comunica por mensajes TCP con otras estaciones por medio del protocolo de estructura de mensajes creada para el sistema en formato json.
+Estos mensajes tcp generan lanzamiento de mensajes del actor estacion.
+Todas las estaciones conocen desde un incio a toda las estaciones existentes del sistema, para saber a quien acudir cuando su vecino esta caido.
 ```
 struct StationActor {
     station_id: u32, //Id para identificar cada estacion de manera unica, para la estructura de anillo
@@ -378,7 +383,7 @@ struct StationActor {
     logically_dead: Vec<String>, // Lista de nodos que avisaron que se desconectaron, para no pingearlos
 }
 ```
-### Mensajes Estacion
+### Mensajes Station
 ```
 Asumimos que no estoy solo en la red e intento unirme a la red de forma natural, le pregunto a mi vecino quién es el lider y actualizo. Si nadie me responde, significa que estoy solo y me autoproclamo líder
 #[derive(Message)]
@@ -512,7 +517,7 @@ struct ProcessRingElected {
     initiator_id: u32,
 }
 
-/// Si recibimos el mensaje WhoIsLeader y tengo algún líder, repondo la inforamción del líder
+Si recibimos el mensaje WhoIsLeader y tengo algún líder, repondo la inforamción del líder
 #[derive(Message)]
 #[rtype(result = "()")]
 struct ProcessWhoIsLeader(String);
@@ -553,6 +558,24 @@ Actualizo el nodo que estaba simulando desconexion que se acaba de volver a cone
 #[rtype(result = "()")]
 struct RegisterAliveNode(String);
 ```
+### Funciones auxiliares
+```
+Función para flushear eventos al archivo log de la estación
+    fn log_event(&self, event_desc: &str)
+
+funcion auxiliar para enviar pagos y esperar de manera asincrona
+    async fn send_payment(gateway: Addr<PaymentGateway>, payment: PaymentMethod, amount: f64, user_id: u32, station_id: u32) -> bool
+
+Funcion asyncrona para enviar los mensajes a otra estacion partiendo de formato json, usa serde para serializar y enviar el por el TCP socket de tokio
+    async fn send_tcp(addr: String, msg: TcpMessage) -> Result<(), std::io::Error>
+
+Devuelve ID actual y suma uno al contador
+    fn next_event_id(&mut self) -> u32
+
+Actualizo el lider, verificando si antes yo era líder para limpiar mi registro de viajes
+    fn set_leader(&mut self, leader_id: u32, leader_addr: String)
+
+```
 ### PaymentGateway
 Actor encargado de la comunicacion con el binario banco, para delegar los pagos y que este los "procese".
 Comunica a la estacion si el banco respondio ok o error.
@@ -564,8 +587,9 @@ struct PaymentGateway {
 impl Actor for PaymentGateway {
     type Context = Context<Self>;
 }
-
-
+```
+### Mensajes PaymentGateway
+```
 ///Recibe un pago, se conecta con el banco via tcp, y le delega este pago
 /// informa por el channel si fue exitoso o no
 #[derive(Message)]
@@ -578,3 +602,269 @@ struct ProcessPayment {
     reply_to: Option<tokio::sync::mpsc::Sender<bool>>,
 }
 ```
+## Struct utilizados
+### Client
+Actor cliente, el cual actua como la "aplicacion movil" para interactuar por consola con la red de estaciones. Conoce por defecto todas las estacion de la red, al lanzar el binario de usuario este calcula cual es la estacion mas cercana de la red y se intenta conectar a esta, de fallar, pasar a la siguiente etc.
+Por medio de la consola interacciona con el usuario y este redirige las consultas a la red.
+
+```
+pub struct UserClient {
+    pub user_id: u32,
+    pub location: Location,// ubicacion simulada del cliente
+    pub known_stations: Vec<StationInfo>,//todas las estaciones  del sistema, cargada por archivo config
+    pub payment_method: PaymentMethod,//Metodo de pago
+    pub current_trip: Option<TripInfo>,//VIaje actual, o none
+    pub trip_counter: u32,// contador de viaje para identificador de los viajes activos
+    pub log_path: PathBuf
+}
+```
+### Metodos del Client
+
+```
+Logeo de eventos para la reconstrucción, igual que en Station
+    pub fn log_event(&self, event_desc: &str)
+
+Extrae la lógia de cálculo de distancias 
+    fn distance_to(&self, station: &StationInfo) -> isize
+
+Me devuelve la estación más cercana de acuerdo a la distancia calculada
+    pub fn get_nearest_station(&self) -> &StationInfo
+
+Usado en get_bikes para que me devuelvan la estación más cercana viva
+    pub async fn connect_to_network(&self) -> Option<TcpStream>
+
+Busca una estación entre las estaciones conocidas local mediante su ID
+    pub fn get_station_by_id(&self, id: u32) -> Option<&StationInfo>
+
+Actualiza el ID de una estación entre las estaciones conocidas
+    pub fn update_station_id(&mut self, addr: &str, new_id: u32)
+
+Envia el mensaje `GetBikes` y espera la disponibilidad
+    pub async fn request_availability(&mut self, addr: &str) -> Option<(u32, Vec<u32>, usize)>
+
+formulacion de mensaje para rentar bici de una estacion y verificar el resultado
+    pub async fn rent_bike(&mut self, addr: &str, bike_id: u32, target_station: StationInfo) -> bool
+
+formulacion de mensaje para devolver bicicleta
+    pub async fn return_bike(&mut self, addr: &str) -> bool
+
+```
+### Funciones auxiliares Client
+
+```
+Función para la recuperación del último viaje activo no cerrado del usuario como el usuario solamente puede tener un único current_trip, entonces solamente me importa la última línea del log, si la última línea es un ACTIVE_TRIP si es CLOSED TRIP significa que no hay ningún viaje activo 
+    pub async fn recover_state_from_log(log_path: &PathBuf) -> Option<TripInfo>
+
+Parsea un archivo de texto plano para construir la red de estaciones
+    pub fn load_stations_from_config(path: &str) -> Vec<StationInfo>
+
+```
+
+### Payment_method
+
+Estructura para simular metodo de pago. Deriva su serializacion al crate serde
+para enviarlo como bytes de string y recibirlo como bytes de string y luego reconstruir el json
+
+```
+use serde::{Deserialize, Serialize};
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum PaymentMethod {
+    /// Representa una tarjeta de crédito mediante su numeración
+    CreditCard(String),
+}
+```
+
+### Location
+Estructura para representar la ubicacion, en coordeandas x,y. Deriva su serializacion y deserializacion a serde para trabajar en formato json
+
+```
+use serde::{Deserialize, Serialize};
+
+/// Representa las coordenadas x,y
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct Location {
+    pub location: (usize, usize),
+}
+```
+
+### Station_event
+Representamos los eventos que pueden suceder en una estacion que involucran sincronizar estado global
+```
+#[derive(Serialize, Deserialize, Debug, Clone)]
+///Representamos los eventos que suceden en una estacion
+pub enum StationEvent {
+    BikeRented {
+        event_id: u32,
+        user_id: u32,
+        station_id: u32,
+        bike_id: u32,
+        timestamp: DateTime<Utc>,
+    },
+    BikeReturned {
+        event_id: u32,
+        user_id: u32,
+        station_id: u32,
+        bike_id: u32,
+        start_time: DateTime<Utc>,
+        return_time: DateTime<Utc>,
+        payment_method: PaymentMethod,
+    },
+}
+```
+
+### Station_info
+Estructura que representa informacion clave de la estacion que es necesaria enviar
+por mensaje. Deriva su serializacion y deserializacion a serde para trabajar con formato json
+
+```
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StationInfo {
+    pub station_id: u32,
+    pub location: (usize, usize),
+    pub addr: String,
+}
+```
+
+### trip_info
+Estructura para almecenar la informacion de un viaje en curso y poder enviar y recibir la informacion de manera mas sencilla. Por ejemplo para cuando queremos enviar la inicializacion de un viaje al lider. Deriva su serializacion y deserializacion a serde para poder trabajar con formato json. Utiliza Chrono para sacar timestamp del momento exacto en que sucede el viaje
+
+```
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use crate::models::station_info::StationInfo;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+///Informacion del viaje para operaciones
+pub struct TripInfo {
+    pub trip_id: u32,
+    pub current_bike_id: u32,
+    pub start_time: DateTime<Utc>,
+    pub last_owner_station: StationInfo,
+}
+```
+
+### Tcp_message
+Estructa fundamental para la comunicacion entre estaciones, definimo un protocolo de comunicacion por tcp con la siguiente estructa y de esta menera al recibir algo por stream TCP, podemos matchear el caso y derivar el curso de accion.
+Ademas esta estructura nos permite extender comportamiento en caso de necesitar nuevas funcionalidades, sirve como un buen punto de entrada entre estaciones.
+Utilizamos serde, para trabajar con formato json
+```
+use serde::{Deserialize, Serialize};
+use crate::models::payment_method::PaymentMethod;
+use crate::models::trip_info::TripInfo;
+use crate::models::station_event::StationEvent;
+
+/// Protocolo de comunicación serializable sobre TCP.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum TcpMessage {
+    GetBikes,
+    Availability {
+        station_id: u32,
+        bikes_available: Vec<u32>,
+        free_slots: usize,
+    },
+    GetAllStationsAvailability {
+        origin_station_id: u32, 
+        // (station_id, station address, available_bikes, free_slots)
+        stations_availability: Vec<(u32, String, Vec<u32>, usize)> 
+    },
+    RentBike {
+        user_id: u32,
+        bike_id: u32,
+        payment_method: PaymentMethod,
+    },
+    RentResponse {
+        success: bool,
+        message: String,
+    },
+    ReturnBike {
+        user_id: u32,
+        bike_id: u32,
+        payment_method: PaymentMethod,
+        trip_info: TripInfo,
+    },
+    ReturnResponse {
+        success: bool,
+        message: String,
+    },
+    WhoIsLeader {
+        origin_addr: String,
+    },
+    RingElection {
+        active_nodes: Vec<u32>,
+    },
+    RingElected {
+        active_nodes: Vec<u32>,
+        leader_id: u32,
+        leader_addr: String,
+        initiator_id: u32, 
+    },
+    RequestPendingEvents {
+        origin_addr: String,
+        ttl: usize,
+    },
+    SyncEvent {
+        origin_addr: String,
+        event: StationEvent,
+    },
+    EventACK {
+        event_id: u32,
+    },
+    ClosedTrip {
+        bike_id: u32,
+    },
+    
+    QueryTrips {
+        origin_addr: String,
+        ttl: usize,
+    },
+    QueryTripsResponse {
+        trips: Vec<TripInfo>,
+        error: bool,
+    },
+    NodeDisconnected {
+        dead_addr: String,
+    },
+    NodeReconnected {
+        alive_addr: String,
+    },
+}
+```
+## Metodo de uso
+**Importante antes de querer ejecutar el sistema, si se quiere comenzar una simulacion desde 0 es fundamental borrar los log del sistema, puesto que sino el sistema buscara reconstruir el ultimo estado online.**
+Para poder usar la aplicacion se debe ejecutar en cada terminar una estacion diferente.
+```
+cargo run --bin station <id> <max_Slots> <src/bin/config/cf2>
+```
+Este ultimo parametro es el path de configuracion de la estacion
+en base al id pasado, **que debe existir en el config**. En base a este id setea el puerto de escuha
+
+### Ejemplo de ejecucion
+Contando con  src/bin/config/cf2 este file de config
+```
+Terminal1: cargo run --bin station 1 10 src/bin/config/cf2
+Terminal2: cargo run --bin station 2 10 src/bin/config/cf2
+Terminal3: cargo run --bin station 3 10 src/bin/config/cf2
+```
+Nos generara una estacion en el puerto 8001, otra en el 8002 y finalmente una en el 8003
+___
+Luego es necesario levantar el bank:
+```
+
+```
+
+___
+Finalmente para conectar usuarios es necesario lanzar otra terminal con el binario cliente de la siguiente forma
+```
+cargo run --bin cliente <pos_x> <pos_y> <id> src/bin/config/cf1
+```
+Donde este utlimo es el archivo de configuracion para que el cliente conosca la red total (este predida o no) de las estaciones y sepa calcular cual es la mas cercana
+### Ejemplo de ejecucion
+```
+cargo run --bin cliente 11 12 1 src/bin/config/cf1
+```
+Este nos genera en una terminal el binario cliente que se conectara a la estacion mas cercana de la red, en este caso la 1. Luego habilita inmediatamente al cliente a poder interactuar con el sistema
+___
