@@ -168,3 +168,113 @@ async fn main() {
         }
     }
 }
+
+
+/// TEST UNITARIOS USER 
+#[cfg(test)]
+mod tests {
+    use bici_concu::models::{station_info::StationInfo, trip_info::TripInfo};
+
+use super::*;
+
+    fn temp_path(test_name: &str) -> PathBuf {
+        PathBuf::from(format!("log_{}.log", test_name))
+    }
+
+    fn station_info(id: u32, location: (usize, usize), addr: &str) -> StationInfo {
+        StationInfo {
+            station_id: id,
+            location,
+            addr: addr.to_string(),
+        }
+    }
+
+    fn base_user(known_stations: Vec<StationInfo>) -> UserClient {
+        UserClient {
+            user_id: 1,
+            location: Location { location: (0, 0) },
+            known_stations,
+            payment_method: PaymentMethod::CreditCard("1111-1111-1111-1111".to_string()),
+            current_trip: None,
+            trip_counter: 1,
+            log_path: temp_path("user_client_test"),
+        }
+    }
+
+    #[test]
+    fn unit_get_nearest_station_returns_closest_station_by_distance() {
+        // La estación más cercana al usuario ubicado en (0, 0) es la estación 2
+        let user = base_user(vec![
+            station_info(1, (10, 10), "127.0.0.1:8001"),
+            station_info(2, (2, 1), "127.0.0.1:8002"),
+            station_info(3, (5, 5), "127.0.0.1:8003"),
+        ]);
+
+        let nearest = user.get_nearest_station();
+
+        assert_eq!(nearest.station_id, 2);
+        assert_eq!(nearest.addr, "127.0.0.1:8002");
+    }
+
+    #[tokio::test]
+    async fn unit_recover_state_from_log_returns_active_trip_when_last_line_is_active_trip() {
+        // Si la última línea del log es un ACTIVE_TRIP significa que cuando el usuario se cayó tenía
+        // un viaje en curso, debemos remontar ese viaje cuando volvemos a levantar el usuario
+        let log_path = temp_path("recover_active_trip");
+
+        let trip = TripInfo {
+            trip_id: 1,
+            current_bike_id: 1,
+            start_time: chrono::Utc::now(),
+            last_owner_station: station_info(3, (5, 5), "127.0.0.1:8003"),
+        };
+
+        let log_content = format!(
+            "[2026-01-01T00:00:00Z] ACTIVE_TRIP: {}\n",
+            serde_json::to_string(&trip).unwrap()
+        );
+
+        std::fs::write(&log_path, log_content).unwrap();
+
+        let recovered = recover_state_from_log(&log_path).await;
+
+        assert!(recovered.is_some());
+        let recovered_trip = recovered.unwrap();
+
+        assert_eq!(recovered_trip.trip_id, 1);
+        assert_eq!(recovered_trip.current_bike_id, 1);
+        assert_eq!(recovered_trip.last_owner_station.station_id, 3);
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn unit_recover_state_from_log_returns_none_when_last_line_is_closed_trip() {
+        // Si el log termina en un CLOSED_TRIP significa que el viaje que estaba en curso cerró 
+        // asi que cuando me levante no debe haber ningún viaje en curso
+        let log_path = temp_path("recover_closed_trip");
+
+        let trip = TripInfo {
+            trip_id: 1,
+            current_bike_id: 55,
+            start_time: chrono::Utc::now(),
+            last_owner_station: station_info(3, (30, 30), "127.0.0.1:8003"),
+        };
+
+        let log_content = format!(
+            "[2026-01-01T00:00:00Z] ACTIVE_TRIP: {}\n\
+             [2026-01-01T00:10:00Z] CLOSED_TRIP: {}\n",
+            serde_json::to_string(&trip).unwrap(),
+            serde_json::to_string(&Some(trip)).unwrap()
+        );
+
+        std::fs::write(&log_path, log_content).unwrap();
+
+        let recovered = recover_state_from_log(&log_path).await;
+
+        assert!(recovered.is_none());
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+}
