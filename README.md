@@ -987,4 +987,13 @@ Donde este utlimo es el archivo de configuracion para que el cliente conosca la 
 cargo run --bin cliente 11 12 1 src/bin/config/cf1
 ```
 Este nos genera en una terminal el binario cliente que se conectara a la estacion mas cercana de la red, en este caso la 1. Luego habilita inmediatamente al cliente a poder interactuar con el sistema
+
+## Diagramas de Flujo
+
+Diagramas de flujo de los casos felices de alquiler y devolución de bicicletas. Se muestra la interacción de StationActor con el actor PaymentGateway. Y la interacción del actor PaymentGateway con el proceso Bank. No se muestra del todo la interacción con el resto de las estaciones de la red. 
+
+### RENT 
+![Flowchart Rent](img/FlowRent.png)
+### RETURN 
+![Flowchart Return](img/FlowReturn.png)
 ___
