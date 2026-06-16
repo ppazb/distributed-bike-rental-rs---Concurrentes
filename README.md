@@ -604,7 +604,7 @@ struct ProcessPayment {
 ```
 ## Struct utilizados
 ### Client
-Actor cliente, el cual actua como la "aplicacion movil" para interactuar por consola con la red de estaciones. Conoce por defecto todas las estacion de la red, al lanzar el binario de usuario este calcula cual es la estacion mas cercana de la red y se intenta conectar a esta, de fallar, pasar a la siguiente etc.
+ Estructura para simular cliente, el cual actua como la "aplicacion movil" para interactuar por consola con la red de estaciones. Conoce por defecto todas las estacion de la red, al lanzar el binario de usuario este calcula cual es la estacion mas cercana de la red y se intenta conectar a esta, de fallar, pasar a la siguiente etc.
 Por medio de la consola interacciona con el usuario y este redirige las consultas a la red.
 
 ```
@@ -834,10 +834,125 @@ pub enum TcpMessage {
 }
 ```
 ## Casos de uso
-### 1 station y 1 user
+Teniendo 1 station y 1 user, banco funcionando
 Lanzo un binario station, el cual desde el archivo de config + los argumentos seteara todo lo necesario para el actor station, que se levantar en el binario.
 Desde este momento, cuando el actor inicie y chequee su siguiente director y posteriormente las demas estaciones se dara cuenta que esta solo, por lo tanto se autoproclama lider.
-Ahora lanzamos el binario cliente, este con el archivo de configuracion 
+Ahora lanzamos el binario cliente, este con el archivo de configuracion cargara las estacion de la red, y en base a su posicion se conectara a la mas cercana, en caso de no estar la mas cercana informara esto y se conectara a la siguiente mas cerca disponible.
+### 1- Obtener las bicis
+Ahora tenemos 1 usuario (*u1*) conectado a la estacion 1 (*s1*):
+- se escribe get_bikes por consola u1.
+- u1 crea un tcp_message del enum "get_bikes" lo serializada con serde y lo envia por el socket a su estacion mas cercana.
+- u1 no se bloquea esperando respuesta, pues se utiliza socket asincronos de tokio
+- a s1 le llega un un mesaje por sokcet, deserializa y verifica que clase de tcp_message llego.
+- matchea el caso de uso y detecta que fue un GetAllStationsAvailability.
+- s1 actua en base a esto, como esta conectada a la red, deberia propagar este mensaje a los demas en la red, pero como no tiene siguiente crea una respuesta para el usuario, añade sus bicis y escribe por el socket.
+-u1 estaba escuchando por medio de una tarea asincrona la respuesta, detecta esta respuesta, deserializa el tcp_message y muestra por pantalla las bicis libres.
+
+### 2- Rentar bici 5 de estacion 1
+- En el binario u1,introducimos "rent 1 2".
+- Dentro u1 se procesa este input, se verifica que sea valido y luego envia un mensaje a su estacion mas cercana bajo el protocolo tcp_message, en donde incluye los datos de la bici y estacion.
+- u1 crea el mensaje tcp_message rentbike y envia por socket a la estacion mas cercana s1, en este caso.
+- Dentro de s1, a traves de listener del socket asincrono detecta paquetes, deserializa, detecta un tcp_message y matchea el caso, en este caso RentBike.
+- En este momento s1 revisa si tiene esta bici, si es asi se envia el mensaje "exec rent", caso contrario como las bicis tienen id unico, propaga por tcp "RentBike" a su siguiente.
+- Como s1, tiene esta bici suceden 2 cosas primer se verifica el pago, luego se auto envia el mensaje exect rent y trabajara en base a esto.
+- Dentro s1 al recibir el mensaje exec rent, usa su handler y comienza a operar.
+- s1 crea el evento "bikerented", se encolo en pending events de la estacion.
+- s1 flushea esto en el log fisico.
+- s1 se envia el mensaje synctoleader, para informar al lider de este evento para que el mismo, actualice la fuente de la verdad.
+- s1 es el lider por lo que recibira este mensaje y actualizara el registro de la verdad.
+- Ademas de sincronizar con el lider, s1 responde a u1 con la bici rentada, serializando el mensaje RentResponse.
+- u1 recibe la respuesta por socket, deserializa, y crea un struc trip con dicha bici, si esto fallara muestra por pantalla alquiler denegado.
+
+### 3- Devolver bici a estacion 1
+- en la consola del binario usario se ingresa return 1. Notese que solo se especifica en que estacion devolver ya que no interesa el id de la bici.
+- u1 procesara el input, verificara que tenga sentido, es decir que tenga una bici que devolver, que el id de estacion sea un numero valido etc y en caso correcto creara un tcp message para comunicarse ,en este caso, con s1 y enviara por el socket  returnbike, que incluira el id de la bici.
+- s1 detectara por el puerto la llegada de paquetes, deserializara y obtendra el tcp_message, luego matcheara el caso, y procesara returnbike.
+- s1 verificara que tiene espacio para alojar la bici, si no lo tiene, creara un tcp_message de respuesta en donde incluira que no pude devolver la bici e imprimira por su consola el mensaje.
+- como si tiene espacio s1, procedera, se autoenviara el mensaje execreturn y a su vez avisara a u1 por tcp, con una respuesta de ok.
+- al recibir el mensaje de actor exectReturn s1 comenzara la operacion,encolara el id de bici, creara un evento de returnbike, con los datos de s1 y la bici.
+-s1 encola el evento en eventos pendientes, logueara el evento en disco, acto seguido logueamos que se añadio un evento pendiente por si caemes antes de que el lider sincronice
+- s1 comunicara por pantalla que se acepto la devolucion y procedera a enviarse el mensaje de actor para sincronizar con el lider.
+- u1 ya habra visto que su retorno fue valido y puede seguir operando.
+
+### 4- Rentar sin banco funcionando
+Si el banco esta caido, no se puede operar. En el enunciado partimos de la base que el banco funciona siempre asique si por lo que fuera este no se diera no tiene sentido permitir las operaciones.
+
+### 5- Devolver a estacion 1 (sin haber alquilado)
+- u1 intenta devolver una bici a la estacion 1, como no tiene viajes activos, se rechaza la operacion
+
+### 6- Rentar en station 1 la bici 1, luego otro usuario trata de rentar bici 1
+- u1 renta bici 1 de station 1.
+- operacion exitosa s1 devuelve el ok a u1 ademas de validar y actualizar todo como mencionamos antes.
+- u1 intenta rentar bici 1 de station 1.
+- u1 ya tiene bici rentada, rechazo automatico
+
+### 7- Rentar una bici que fue alquilada
+- supongamos que un usuario u2, realiza rent 1 1.
+- s1 responde ok entrega la bici y actualiza todo.
+- u2 ahora tiene viaje con bici 1.
+- u1 ahora intenta hacer rent 1 1.
+- s1 recive la peticion y al buscar dicha bici, no la encuentra por lo tanto genera como respuesta un rechazo de la peticion.
+- u1 recibe la respuesta e imprime por pantalla que no se pudo alquilar.
+
+### 8- Rentar bici que no existe en la estacion
+- u1 realiza rent 1 400.
+- s1 recibe la peticion, busca la bici no la encuentra y rechaza el alquiler.
+- u1 recibe el rechazo e imprime por pantalla la falla del alquiler.
+
+### 9 - Entra una nueva estacion en la red
+- s1 esta viva.
+- En otra terminal lanzamos una estacion nueva (s3=id=3). 
+- s3 se levanta, s3 no asume que esta sola sino que verificara si se puede conectar a su vecino ideal (suponiendo una red total de 4 estaciones) intentara conectarse a 4, esta falla, ira al siguiente 1.
+- s3 se podra conectar a s1, entonces actualizara su vecino ahora s1.
+- s3 aprobecha y consulta a su vecino "quien es el lider"? por tcp message whoisleader.
+- s1 recibira el mensaje y actuara al respecto verificara si tiene lider y en caso positivo responde quien es el lider.
+- s3 recibe esta respuesta por tcp y actualiza el lider.
+- Ademas, s1 durante este proceso va a detectar que no tiene un vecino, al revisar si este vecino esta vivo, y en este proceso termina iterando la primera estacion mas cercana que le responda y en esta busqueda detectara que s3 responde y actualizara su vecino.
+- Al terminar este proceso s1 -> s3 -> s1.
+- El anillo esta activo y correctamente conectado.
+
+### 10 - Cae el lider (desconectado) eleccion
+- s1 se desconecta de la red.
+- s3 al poco tiempo al chequear si su vecino sigue vivo, detecta que es no lo esta.
+- s3 intenta actualizar su siguiente, no lo encuentra porque no hay otra estacion viva.
+- A su vez s3 sabe que su vecino callo y ademas era lider, lanza eleccion.
+- s3 lanza por tcp a su siguiente starelection. 
+- Como s3 esta solo, nadie mas detecta esto.
+- Pero como esta sola s3, va a autoproclamarse lider.
+- s3 es ahora lider.
+
+### 11 - Cae el lider (ctrl + c) eleccion
+- s1 se cae.
+- s3 al poco tiempo al chequear si su vecino sigue vivo, detecta que es no lo esta.
+- s3 intenta actualizar su siguiente, no lo encuentra porque no hay otra estacion viva.
+- A su vez s3 sabe que su vecino callo y ademas era lider, lanza eleccion.
+- s3 lanza por tcp a su siguiente starelection. 
+- Como s3 esta solo, nadie mas detecta esto.
+- Pero como esta sola s3, va a autoproclamarse lider.
+- s3 es ahora lider.
+
+### 12 - Renta con  desconexion s1 de la red.
+- s1 se desconecta de la red.
+- Ademas de suceder el casi 10 nuevamente.
+- s1 esta caida de la red, pero sigue funcionando.
+- u1 puede enviar rent 1 1 correctamente, el socket sigue abierto.
+- s1 recibe el mensaje y procesa todo correctamente entrega la bici.
+- s1 no tiene siguiente porque esta desconectada, lo detecta y por lo tanto agrega el evento a la cola de enventos y el pago a la cola de eventos puesto que no tiene comunicacion con ellas.
+- u1 se va con su bici.
+- s1 vuelve a conectarse a la red, se intenta conectar a su siguiente mas cercano y sino al siguiente etc.
+- s1 al lograr la conexion, comienza a syncronizar todos los eventos pendientes y pagos.
+- s1 ahora envia en rafaga todas las operaciones que sucedieron al lider.
+
+### 13 - renta y retorno con desconexion
+- s1 se desconecta de la red.
+- s3 actualiza lider, reconstruye el anillo etcc.
+- u1 renta de s1, la operacion sale bien, s1 responde ok.
+- u1 devuelve la bici a station 1.
+- s1 la recibi y devuelve ok.
+- s1 se reconecta a la red.
+- s1 se integra al anillo de forma correcta actualiza el lider.
+- s1 comienza a sincronizar los eventos con el lider, enviando tanto el rent y el return para su posterior desencole de pagos, una vez que se confirma tanto el alquiler como luego el retorno.
+
 ## Metodo de uso
 **Importante antes de querer ejecutar el sistema, si se quiere comenzar una simulacion desde 0 es fundamental borrar los log del sistema, puesto que sino el sistema buscara reconstruir el ultimo estado online.**
 Para poder usar la aplicacion se debe ejecutar en cada terminar una estacion diferente.
