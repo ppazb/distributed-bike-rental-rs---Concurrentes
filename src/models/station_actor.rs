@@ -1422,3 +1422,197 @@ pub fn recover_state_from_log(log_path: &PathBuf, mut available_bikes: Vec<u32>)
     let pending_payments: VecDeque<(PaymentMethod, f64, u32, u32)> = pending_payments_map.into_values().collect();
     (available_bikes, event_counter, pending_events, pending_payments)
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Una vez que hacemos start() al actor ya no tenemos más acceso al estado interno del actor
+    #[derive(Debug, Clone)]
+    struct StationState {
+        available_bikes: Vec<u32>,
+        pending_events: Vec<StationEvent>,
+    }
+
+    // Creamos un mensaje interno para obtener una copia del estado interno de los atributos internos 
+    #[derive(Message)]
+    #[rtype(result = "StationState")]
+    struct GetState;
+
+    impl Handler<GetState> for StationActor {
+        type Result = MessageResult<GetState>;
+
+        fn handle(&mut self, _msg: GetState, _ctx: &mut Self::Context) -> Self::Result {
+            // Cuando recibo este mensaje deuelvo la copia del estado 
+            MessageResult(StationState {
+                available_bikes: self.available_bikes.clone(),
+                pending_events: self.pending_events.iter().cloned().collect(),
+            })
+        }
+    }
+
+    fn temp_log_path(test_name: &str) -> PathBuf {
+        PathBuf::from(format!("test_station_actor_{}.log", test_name))
+    }
+
+    fn station_info(id: u32, addr: &str) -> StationInfo {
+        StationInfo {
+            station_id: id,
+            location: (0, 0),
+            addr: addr.to_string(),
+        }
+    }
+
+    fn start_test_station(
+        station_id: u32,
+        available_bikes: Vec<u32>,
+        max_slots: usize,
+        is_disconnected: bool,
+    ) -> Addr<StationActor> {
+        let addr = format!("127.0.0.1:{}", 30000 + station_id);
+        let gateway = PaymentGateway {
+            bank_addr: "127.0.0.1:4000".to_string(),
+        }
+        .start();
+
+        StationActor {
+            station_id,
+            addr: addr.clone(),
+            location: (0, 0),
+            max_slots,
+            available_bikes,
+            leader: None,
+            known_stations: vec![station_info(station_id, &addr)],
+            next_station_addr: None,
+            payment_gateway: gateway,
+            pending_events: VecDeque::new(),
+            pending_payments: VecDeque::new(),
+            active_trips: HashMap::new(),
+            orphan_returns: HashMap::new(),
+            log_path: temp_log_path(&format!("station_actor_test_{}", station_id)),
+            is_electing: false,
+            event_counter: 1,
+            is_disconnected,
+            logically_dead: Vec::new(),
+        }
+        .start()
+    }
+
+    #[actix_rt::test]
+    async fn test_exec_rent_removes_bike_and_enqueues_bike_rented_event() {
+
+        // Si ejecutamos RentBike sacamos una bici y se encola un evento de BikeRented
+        let station = start_test_station(1, vec![1, 2], 10, true);
+
+        station
+            .send(ExecRent {
+                user_id: 1,
+                bike_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let state = station.send(GetState).await.unwrap();
+
+        assert_eq!(state.available_bikes, vec![2]);
+        assert_eq!(state.pending_events.len(), 1);
+
+        match &state.pending_events[0] {
+            StationEvent::BikeRented {
+                event_id,
+                user_id,
+                station_id,
+                bike_id,
+                ..
+            } => {
+                assert_eq!(*event_id, 1);
+                assert_eq!(*user_id, 1);
+                assert_eq!(*station_id, 1);
+                assert_eq!(*bike_id, 1);
+            }
+            other => panic!("Se esperaba BikeRented, pero llegó {:?}", other),
+        }
+    }
+
+    #[actix_rt::test]
+    async fn test_closed_trip_removes_matching_bike_rented_event() {
+        // Probamos Rent y después Return, no debería haber un match de evento pendiente de bike_id == 1
+        let station = start_test_station(1, vec![1, 2], 10, false);
+
+        station
+            .send(ExecRent {
+                user_id: 1,
+                bike_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let before = station.send(GetState).await.unwrap();
+        assert_eq!(before.pending_events.len(), 1);
+
+        // Enviamos el mensaje de ReceivedClosedTrip de la Bici 1 y esperamos la respuesta 
+        station.send(ReceiveClosedTrip(1)).await.unwrap();
+
+        // Obtenemos el estado 
+        let after = station.send(GetState).await.unwrap();
+
+        // Para todos los BikeRented eventos que quedaron ninguno matchea con el bike_id == 1 porque 
+        // ya fue devuelto
+        assert!(
+            after.pending_events.iter().all(|event| {
+                !matches!(event, StationEvent::BikeRented { bike_id, .. } if *bike_id == 1)
+            }),
+            "El BikeRented de la bici 1 debería haberse removido"
+        );
+    }
+
+    #[test]
+    fn test_recover_state_from_log_restores_bikes_and_pending_events() {
+        // Probamos restaurar los pending_events del log
+        let log_path = temp_log_path("recover_state_from_log");
+
+        let event = StationEvent::BikeRented {
+            event_id: 1,
+            user_id: 1,
+            station_id: 1,
+            bike_id: 10,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let log_content = format!(
+            "[2026-01-01T00:00:00Z] BIKE_RENTED: 10\n\
+             [2026-01-01T00:00:01Z] PENDING_EVENT_ADD: {}\n",
+            serde_json::to_string(&event).unwrap()
+        );
+
+        std::fs::write(&log_path, log_content).unwrap();
+
+        let initial_bikes = vec![8, 9, 10];
+        let (recovered_bikes, _ , recovered_pending_events, _) =
+            recover_state_from_log(&log_path, initial_bikes);
+
+        // De los iniciales solamente tengo 8 y 9 porque por el log PENDING_EVENT_ADD obtengo que BIKE_RENTED: 10 
+        // todavía no me confirmaron la devolución de la bici 10
+        assert!(!recovered_bikes.contains(&10));
+        assert!(recovered_bikes.contains(&9));
+        assert_eq!(recovered_pending_events.len(), 1);
+
+        match &recovered_pending_events[0] {
+            StationEvent::BikeRented {
+                event_id,
+                bike_id,
+                user_id,
+                ..
+            } => {
+                assert_eq!(*event_id, 1);
+                assert_eq!(*bike_id, 10);
+                assert_eq!(*user_id, 1);
+            }
+            other => panic!("Se esperaba BikeRented recuperado, llegó {:?}", other),
+        }
+
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+}
